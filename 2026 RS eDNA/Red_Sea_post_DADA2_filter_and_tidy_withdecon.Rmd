@@ -1,0 +1,1189 @@
+---
+title: "Red Sea surface - post-DADA2 filtering and tidy"
+author: "Nathan R. Geraldi"
+date: "2026 update"
+output: github_document
+---
+
+set table options
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## renv — package version locking
+To lock exact package versions for reproducibility, run once from the R console
+after all packages are installed and working:
+```r
+# renv::init()     # first time: initialise and snapshot
+# renv::snapshot() # after adding/updating packages
+# renv::restore()  # collaborators run this to install exact same versions
+```
+Do NOT run renv::init() mid-analysis — do it when the project is stable and
+ready for GitHub. The renv.lock file should be committed to the repository.
+
+## libraries
+```{r libraries, message=FALSE, warning=FALSE}
+#library(RColorBrewer)
+#library(rdrop2)  # what is this used for?
+library(vegan)
+library(fields)
+library(psych)
+library(tidyverse)
+library(here)        # robust paths relative to .Rproj root 
+
+select<-dplyr::select
+# need these installed, but not loaded
+# BiocManager::install("DECIPHER")
+# library(Biostrings) # need this package to install - install.packages("BiocManager")
+
+```
+
+## functions
+```{r functions, message=FALSE, warning=FALSE}
+# function to remove rows with n number of NA's
+delete.na <- function(DF, n=0) {
+  DF[rowSums(is.na(DF)) <= n,]
+}
+```
+
+
+## define universal variables
+```{r define_universal}
+
+stud_pat <- "RS_surface"
+
+## All inputs, outputs, and plots live in the '2026 RS eDNA' folder.
+## here::here() resolves the absolute path from the .Rproj root, so this
+## works both when knitting and when running chunks interactively in RStudio.
+dir         <- paste0(here::here("2026 RS eDNA"), "/")
+dada2_path  <- paste0(dir, "Dada2_output/")   # DADA2 pipeline output files
+export_file <- ""                              # CSV exports → dir
+out_file    <- ""                              # summary outputs → dir
+summary_file<- ""                              # manuscript tables → dir
+
+# name for the main filtered data CSV saved at the end
+export_name <- paste0(stud_pat, "_filtered_data_all.csv")
+
+## set some other universal variables
+
+####  !!!! need to be in alphabetical order - tabs in sam_file should match these names too !!!!! also have "type"" column
+primers<-c('18smini',"euka02")  # 18S_V9 and 18S_V7 only; CO1 and 12S excluded
+n_primers<-length(primers)
+## must be in alphabetical order
+minboots<-c("insect",50,70,90)  # for getting all data minboots and insect data
+min_insect_score<-0.80# set minimum score for insect taxa score
+###################           filtering parameters
+## filter based on occurance in samples
+min_samples_include<-2  # used duing filtering SV's in < this number will be removed
+
+## filter based on proportion in samples
+sam_sum_prop_cut<-0.0001 ## remove SV's with less than this propotion of reads per miseq
+      # examples 10 million reads if 0.0001 then remove SV with lesst than 100 reads (remove ~25-50% SV) .......OK  USED
+      # examples 10 million reads if 0.001 then remove SV with lesst than 1000 reads (remove ~60-80% SV) .......conservative
+     # logic - if very low percent in sample samples, then likely errors.
+
+## decontam: numeric proxy for below-detection-limit DNA concentration
+## Samples recorded as "<0.50 ng/mL" in the Excel are read as NA by openxlsx.
+## decontam requires all concentration values to be positive numbers (> 0),
+## so below-detection samples are assigned this proxy value instead of NA.
+## It means "DNA present but unquantifiable" — adjust if your detection limit differs.
+decontam_conc_low <- 0.01  # ng/µl proxy for samples with conc recorded as "<0.50 ng/mL"
+
+## contamination removal: minimum number of blank samples an SV must appear in
+## (reads > 0) to be removed as a contaminant.  Used in decontam_check together
+## with decontam (combined method) — SVs are removed if flagged by EITHER rule.
+blank_n_remove <- 3
+
+## set minumum number for rarefaction -- some samples usually have very few reads, partucularly for cores
+#    !!!!!!! estimate run script and look at rare_mins,..... then choose!!!  !!!!!!!! -- 1000 to 5000 ?????????
+min_num_rarefaction<-5000
+
+#  stil run but NO longer used - now based on occurance within each miseq run - at later time.
+
+#####################
+##   for summary tables
+###  change from old to new names
+primers_summary_old<-c("euka02",'18smini')
+primer_names<-data.frame( "Primer1"=c("18S_V7","18S_V9"), "primer_pair"= primers_summary_old, stringsAsFactors = FALSE)
+primers_summary<-c("18S_V7","18S_V9")
+minboots_summary<-c("70")  # character to match taxa_assign column after separate()
+
+
+############
+################### set file path and name of sample data
+## each primer should have own sheet with name matching primers
+## primer sheets first then location sheet (1 row per each sample location), then other sheets with relevent data
+sam_file_path <- paste0(dir, "RS_surface_sample_data_all.xlsx")
+
+## number of columns in the primers specific sheets, should be the same for all primer pairs, 
+num_sample_cols<-10  ####
+##
+
+```
+
+
+## import data
+Sample data excel sheet should include sheet for each primer pair - samples id column then other info
+then a sheet with locations, then a sheet with other sample relevant data
+It then imports data from DADA2 pipeline
+```{r import}
+# sample data -- will need Quality control !!! make sure sample_se make sense
+sheets <- openxlsx::getSheetNames(sam_file_path)
+sam_dat <- lapply(sheets,openxlsx::read.xlsx,xlsxFile=sam_file_path)  # mes1<-sam_dat[[2]]   names(mes1)  names(sam_dat)
+names(sam_dat) <- sheets   # add name to each list
+
+##    move to next .Rmd - nothing to do here
+# locations<-sam_dat[[n_primers+1]]  # isolate locations  ! double check depending
+sample_dat<-sam_dat$sample_data # isolate other data
+##
+
+sam_dat <-sam_dat[1:n_primers]   # keep only primer sample data
+sam_dat <- lapply(sam_dat, function(df) mutate_at(df, .vars="sample_ID", as.character))  # make sure sample_ID is character
+sample_sam<-bind_rows(sam_dat, .id = 'id')  # names(sample_sam)   ## bind al primer pair data into single datagrame
+
+#  import taxonomy assigned to sequences  
+# summary, seqtab and taxass    list.files()    unique(sam$type)
+## list.files with explicit path — avoids setwd() side-effects in Rmd
+## full.names=TRUE returns the complete path so read functions work regardless of WD
+f_tax <- list.files(path = dada2_path, pattern = paste0(stud_pat, ".*taxass.*\\.csv"), full.names = TRUE)
+f_sum <- list.files(path = dada2_path, pattern = paste0(stud_pat, ".*summary\\.csv"),  full.names = TRUE)
+f_rds <- list.files(path = dada2_path, pattern = paste0(stud_pat, ".*seqtab\\.rds"),   full.names = TRUE)
+##   import all data into lists            names(sum)  names(tax_list)
+###  may need to add  "sample1" to last column ????
+tax_list<-setNames(lapply(f_tax, read.csv), tools::file_path_sans_ext(basename(f_tax)))  # mes1<-tax_list[[2]]  names(mes1)
+
+
+## make sure tax_list names match primer names and sample_sam
+intersect(primers, names(sam_dat))
+# intersect(primers, names(tax_list))
+
+# get index for insect taxonomy assigned and add taxonomy comparable to assigntaxonomy from DADA2
+tax_list_insect_num<-grep("insect", names(tax_list))
+# fix taxonomy of insect    match insect name to dada2 nameing
+for (i in tax_list_insect_num){
+     tax_list[[i]]<-tax_list[[i]] %>% 
+       # mes1<-tax_list[[9]]   %>% 
+       dplyr::rename(Superkingdom=superkingdom, Kingdom=kingdom,Phylum=phylum, Class=class, Order=order, Family=family, Genus=genus, Species=species ) %>% 
+       mutate(X = taxID) %>%  ## add to match seq from tax assign
+        select(-representative,-taxID,-taxon,-rank) %>%
+       mutate_if(is.factor, as.character) %>% 
+       mutate_at(vars(Superkingdom:Species), list(~na_if(., ""))) %>% # convert blank to NA
+       mutate_at(vars(Superkingdom:Species), list(~ifelse(!is.na(score) &  score < min_insect_score, NA, .))) %>%  ## min score turn taxa blank   -  min_insect_score !is.na(score) &
+       select(-score, -contains("sample1")) ## 3 remove score
+     }
+ ## mes1<-tax_list[[9]]       names(mes1)
+       
+
+
+
+# get summary of reads from filter steps of DADA2
+
+summar<-setNames(lapply(f_sum, read.csv), tools::file_path_sans_ext(basename(f_sum)))  # names(summar) mes1<-summar[[1]] 
+## get seqtab tables from dada2  -- sample_id are row names and colnames are SV sequence
+sv_list<-setNames(lapply(f_rds, readRDS), tools::file_path_sans_ext(basename(f_rds))) # mes1<-sv_list[[2]]  row.names(mes1)
+```
+
+## tidy data
+
+```{r tidy}
+#######################################
+# tidy     ! DADA2  summary tables !    table from dada2 pipe
+
+## make column name lower for sample information
+sample_dat<-sample_dat %>% 
+    rename_all(tolower)
+
+
+#######   tidy summary data     #################
+## add column for primer and sampple_id  mes<-summar[[1]]  mes<-mes$sample_id
+for (i in seq_along(summar)){
+  summar[[i]]["sample_num"] <- rownames(summar[[i]]) }  #  
+## most are numbers so need to convert to sample_id from sample sheets, switching between sample_num and sample_id need to be chekced
+
+# bind into dataframe
+sum2<-bind_rows(summar, .id = 'names(sum)')
+names(sum2)[1]<-"study_primer"
+## get name of primer and clean up - NEED TO CHECK each time !!!!
+sum2 <-sum2 %>% 
+  rename_all(tolower) %>% 
+  mutate(primer=study_primer) %>%
+  mutate(primer=gsub("^.*?_","",primer)) %>%  # remove everything before first "_"
+  mutate(primer=gsub("_[^_]+$","",primer)) %>%   # remove after last "_"
+   mutate(primer=gsub("^.*?_","",primer)) %>% 
+  mutate(primer=gsub("_","",primer)) %>%   # remove any "_"
+  mutate(study_primer=gsub("_[^_]+$","",study_primer))
+
+
+##############################################################################
+#########    tidy miseq specific data    then   combine with summary   ######### 
+#   names(sam)  unique(sam$primer)  unique(sum2$primer)
+
+# add total number of sequences per sample to each primer sheet
+sample_sam<-sample_sam[,c(1:num_sample_cols)]# keep only common columns  names(sample_sam) 
+sam2<-sample_sam %>%
+  rename_all(tolower) %>% 
+  dplyr::rename(primer=id) %>% 
+  mutate(sample_num=as.character(sample_num)) %>% 
+  left_join(sum2[,7:9]) %>% # keep only nonchim,id,primer
+  dplyr::rename(reads_per_sample_dada=nonchim)   ### reads after DADA2 filters
+
+###### set up sample data-sam2 to merge with tax data
+# set sample list for each primer  use sam2 by primer
+sam_list<-split(sam2,f=sam2$primer) # names(sam_list)   # split data from each primer into list
+
+#  get index to call column names of sample types   x<-sam_list[[1]]
+##      !!!!!!!!!    need to sort samples in alpabetical order    !!!!! see lines below
+## for most miseqs we just use sample_num, during pipe this is ordered as character, so need to be aware
+##  need for next step of indexing columns to sepcify sample type
+sam_list<- lapply(sam_list, function(x) { 
+  row_number_original<-c(1:length(as.numeric(row.names(x)))) 
+  x$sample_num<-as.character(x$sample_num)
+  x<-arrange(x,sample_num)
+  row.names(x)<-NULL
+  row_number<-c(1:length(as.numeric(row.names(x)))) # make index for choose columns of SVs - SV from DADA2 arranges columns by !!!alphabet !!!!! - need to arrage accordingly
+  x<-cbind(x,row_number,row_number_original)    })
+# replicate to match list with primers and nboots.
+ sam_list<-rep(sam_list, each=length(minboots))
+ #####
+ 
+## make lists for each sample type, needed for filtering  x<-sample_index_list[[6]]  unique(sam2$type) x<-sam_list[[3]]
+sample_index_list<- lapply(sam_list, function(x) { 
+  x<-x$row_number[x$type=="sample"]     })
+#
+blank_index_list<- lapply(sam_list, function(x) { 
+  x<-x$row_number[x$type=="extraction blank" | x$type=="pcr blank"]     })  # x<-blank_index_list[[3]] 
+#
+positive_index_list<- lapply(sam_list, function(x) { 
+  x<-x$row_number[x$type=="positive control" | x$type=="mock"]     })
+#
+all_index_list<- lapply(sam_list, function(x) { 
+  x<-x$row_number    })
+
+### make SV list into LIST of dataframes ######################################
+dat<-purrr::map(sv_list, data.frame)
+# make rownames a column, rownames were sample identification, which we use sample number  -  mes<-dat[[1]]  mes$sample_num
+dat<-purrr::map(dat, function(x) rownames_to_column(x, var="sample_num"))  #  mes<- rownames(dat[[3]]) names(dat) all_index_list[[3]]
+```
+
+
+## get cluster seqs (cluster)
+  updated Sept 2024 from arctic surface - seqateurs::cluster_otus no longer worked
+```{r cluster}
+
+ cluster_dat <- dat# make list
+#. i<-1
+for (i in seq_along(dat)){
+
+ cluster_sub<- cluster_dat[[i]]   # remove sample number
+ cluster_sub<-cluster_sub[,-1]
+
+asv_sequences <- colnames(cluster_sub)
+seqs <- Biostrings::DNAStringSet(asv_sequences)
+
+otus <- DECIPHER::Clusterize(
+    seqs,
+    cutoff = 0.03,  # use `cutoff = 0.03` for a 97% OTU
+    method = "overlap",
+    includeTerminalGaps = FALSE,
+    penalizeGapLetterMatches = NA,
+    minCoverage = 0.5,
+    maxAlignments = 100,
+    invertCenters = FALSE,
+    processors = 4) %>%
+    dplyr::mutate(sequence = asv_sequences)  %>%
+    dplyr::group_by(cluster) %>%
+    dplyr::mutate(cluster_size = n_distinct(sequence)) %>%
+    dplyr::ungroup()
+
+cluster_dat[[i]]<-otus
+
+}
+
+
+
+#. testing code
+#.  names(dat)
+##   head(dat[[1]])
+## mes<-cluster_dat[[1]]
+#  dum<-as.data.frame(dat[[3]])
+#  mes<- seqateurs::cluster_otus(dum, similarity = 0.97, cores = 4)
+#   mes3<-data.frame(mes$cluster, dum)
+#  mes2<-unique(mes$cluster) # at 90% 1000, at 97% 5506 
+
+```
+
+
+
+
+## add sequ abund to taxonomy
+
+```{r taxa_w_seq}
+##     transpose seq table and merge to tax table   
+##  dat has first col of sample_ID then colnames is sequence - do not open, will take minutes to view
+dat1<- lapply(dat, function(x) { 
+        s<-names(x) # - sequences of SV
+        id<-x[,1]  # sample_num
+        x<-t(x[,-1])  # transpose , remove sample_num      mes<-names(x)  mes[1]
+        x<-unname(x)
+        x<-data.frame(x)
+        #colnames(x)<-paste("X",id, sep="") ;return(x)
+        x$seq<-s[-1]  ;return(x)
+        })                # mes<-dat[[3]]                             #   x<-dat[[3]]  x2<-dat1[[1]] names(dat1[[3]])
+# assign colnames - which are sample_id
+for (i in seq_along(dat1)){
+  colnames(dat1[[i]]) <- c(paste("X_",dat[[i]][,1],sep=""),"seq")
+}
+########  join sample/otu with taxon  ##############
+##   mes5<-tax_list[[1]]  names(dat3)   names(tax_list)     mes<-dat2[[3]]  names(mes) length(rownames(mes))
+
+## duplicate dat1 to match tax_list    names(dat1)
+dat2<-rep(dat1, each=length(minboots))
+minboot_seq<-rep(minboots, times=length(primers))
+primers_seq<-rep(primers, each=length(minboots))
+primers_minboot<-paste(primers_seq,minboot_seq, sep=";")
+
+############  add with tax_list- for each 
+####   changed to loop and merge - much safer and not worry about orders - merged on seq. and X
+#dat3<-mapply(cbind,dat2,tax_list, SIMPLIFY=F)   # names(dat2) names(tax_list)  #   x<-dat2[[9]]  x2<-tax_list[[5]]
+dat3<-dat2
+for (i in seq_along(dat2)){
+  mes<-dat2[[i]]
+  mes1<-tax_list[[i]]
+  mes1$X<-as.character(mes1$X)
+  mes2<-left_join(mes,mes1 , by = c("seq" = "X"))
+  dat3[[i]]<-mes2
+   }  #  
+
+## add column for minboot
+for (i in seq_along(dat3)){
+    dat3[[i]]["primer"] <- primers_seq[i] 
+    dat3[[i]]["minboot"] <- minboot_seq[i] # taxa assign id
+    dat3[[i]]["seq.1"] <- c(1:length(row.names(dat3[[i]])))  ## sequence number id
+    dat3[[i]]$primer_taxassign_id <- paste(dat3[[i]]$primer,dat3[[i]]$minboot,sep=";")## add new column for id primer&assign
+}
+
+##     mes<-dat3[[9]] mes1<-mes[,96:108]   names(mes)  mes<-x[-which(as.character(x$X) %in% x$seq),]  - mes should have 0 rows!
+# x$X[1]  x$seq[1]. names(dat3)
+```
+
+
+## add (cluster) numbers
+
+```{r add cluster}
+
+## duplicate cluster to match dat1 which was duped to match tax_list    names(dat1)
+cluster_dat2<-rep(cluster_dat, each=length(minboots))
+
+dat3.5<-dat3    #  i<-9  mess<-cluster_dat2[[2]]  messd<-dat3[[2]]
+# colnames(messd) messd2<-messd[,90:109]
+for (i in seq_along(dat3)){
+  mes<-dat3[[i]]
+  mes1<-cluster_dat2[[i]]
+  mes2<-left_join(mes,mes1[,1:2] , by = c("seq" = "sequence"))
+  dat3.5[[i]]<-mes2
+   }  #  
+
+dat3<-dat3.5
+# messd<-dat3.5[[3]]  messd2<-messd[,90:110]
+```
+
+
+## begin filtering
+
+```{r filter}
+####    begin filter SV based on # samples and blanks
+####################################################################################
+      #  mes1<-dat3[[11]]  names(mes1)  mes2<-dat3[[2]]   # names(dat4)  mes0<-tax_list[[2]]  names(tax_list)
+      #  hist(apply(mes1[,samples_index],1,function(x) length(which(x>0)))) # sum SV's per sample
+      #  mes2<-mes1[apply(mes1[,samples_index],1,function(x) (length(which(x>0)))>=min_samples_include),]
+
+
+#### remove SV's in < number of samples  - lapply through all lists
+dat4<-dat3
+after_n_occurance_per_sample <- vector("list", length(names(dat4)))# make dummy list
+names(after_n_occurance_per_sample) <- primers_minboot
+after_n_occurance_per_sample1 <- vector("list", length(names(dat4)))# make dummy list mes<-after_n_occurance_per_sample[[1]]
+names(after_n_occurance_per_sample1) <- primers_minboot
+
+### start loop
+for (i in seq_along(dat4)){   ##  i<-9   names(dat4[[9]])  names(dat4)
+  
+        mes1<-dat4[[i]]
+        mes2<-mes1[apply(mes1[,sample_index_list[[i]]],1,function(x) (length(which(x>0))) >= min_samples_include),]
+   
+        after_n_occurance_per_sample[[i]]<-length(row.names(mes2))
+        after_n_occurance_per_sample1[[i]]<-apply(mes2[,all_index_list[[i]]], 2, sum) # all_index_list was changed apr23,2020
+             dat4[[i]]<-mes2
+      }     #  mes2<-dat4[[16]]  mes1<-dat4[[16]]  names(mes2)  names(mes1)
+
+#  find sample that is not common between index list and dat3 - common error   i<-18
+#    setdiff(as.character(all_index_list[[i]] ), as.character(gsub("X_", "", names(dat3[[i]])[1:96] ) )  )
+
+###################################################
+#### remove SVs with very low proportional reads in samples (likely sequencing errors)
+#### contamination removal (blank-based + decontam) is applied in the decontam_check chunk
+
+dat_filt <- dat4   # copy for downstream filtering   names(dat4)  names(dat2[[1]])
+
+# summary lists for sam_sum_prop filter step (populated below)
+after_min_sample_filt        <- vector("list", length(primers_minboot))
+names(after_min_sample_filt) <- primers_minboot
+after_min_sample_filt1       <- vector("list", length(primers_minboot))
+names(after_min_sample_filt1) <- primers_minboot
+after_min_sample_filt_SVsam  <- vector("list", length(primers_minboot))
+names(after_min_sample_filt_SVsam) <- primers_minboot
+
+# summary lists for contamination filter step (populated in decontam_check)
+after_blank_filt        <- vector("list", length(primers_minboot))
+names(after_blank_filt) <- primers_minboot
+after_blank_filt1       <- vector("list", length(primers_minboot))
+names(after_blank_filt1) <- primers_minboot
+after_blank_filt_SVsam  <- vector("list", length(primers_minboot))
+names(after_blank_filt_SVsam) <- primers_minboot
+
+for (i in seq_along(dat_filt)) {    #  i<-1
+  mes1 <- dat_filt[[i]]
+
+  sv_sum <- apply(mes1[, sample_index_list[[i]]], 1, sum)
+  mes1$sam_sum_prop <- sv_sum / sum(sv_sum)
+
+  # remove SVs with < sam_sum_prop_cut proportion of total reads — likely errors
+  mes2 <- mes1[mes1$sam_sum_prop > sam_sum_prop_cut, ]
+  mes2 <- dplyr::select(mes2, -sam_sum_prop)
+
+  dat_filt[[i]] <- mes2
+
+  # summary stats for this step
+  after_min_sample_filt[[i]]       <- length(row.names(mes2))
+  after_min_sample_filt1[[i]]      <- apply(mes2[, all_index_list[[i]]], 2, sum)
+  after_min_sample_filt_SVsam[[i]] <- apply(mes2[, all_index_list[[i]]], 2, function(x) sum(x > 0))
+}
+     
+ # convert all factors to characters
+ #  and
+ # remove taxonomy that are not assigned to any taxonomy  !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+  after_taxa_clean <- vector("list", length(names(dat_filt)))# for calc of lost SVs
+  names(after_taxa_clean) <- primers_minboot
+   after_taxa_clean1 <- vector("list", length(names(dat_filt)))# for calc of lost reads
+   names(after_taxa_clean1) <- primers_minboot
+   after_taxa_clean1_SVsam <- vector("list", length(names(dat_filt)))# for calc of lost reads
+   names(after_taxa_clean1_SVsam) <- primers_minboot
+ #  mes1<-dat_filt[[10]]
+
+    for (i in seq_along(dat_filt)){ 
+    dat_filt[[i]]<-dat_filt[[i]] %>%   # i<-1
+      tidyr::unite(lineage, Superkingdom:Species,sep=";",remove=F) %>%
+      filter_at(vars(Family:Species), any_vars(complete.cases(.)))    %>%  # NA in all family,genus,species !!!!!!!!
+      filter_at(vars(Phylum:Order), any_vars(complete.cases(.)))    %>%  # NA in all phylum through order  !!!!!!!!
+      mutate_if(is.factor, as.character) %>% 
+      select(-lineage)
+    
+        # get data for summary
+      after_taxa_clean[[i]]<-length(row.names(dat_filt[[i]]))# sum rows, count sum >0
+      after_taxa_clean1[[i]]<-apply(dat_filt[[i]][,all_index_list[[i]]], 2, sum) 
+      after_taxa_clean1_SVsam[[i]]<-apply(dat_filt[[i]][,all_index_list[[i]]], 2, function(x) sum(x > 0)) 
+     }
+# x<-dat_filt[[11]]     filter_at(vars(b, c), any_vars(complete.cases(.))   any_vars(!is.na(.))
+
+  
+```
+
+
+
+## decontam contamination removal (combined method) + blank-count filter
+Removes SVs flagged by decontam OR present in ≥ `blank_n_remove` blanks.
+Updates `dat_filt` in place — run before `sum_by_taxa`.
+Install decontam if needed: BiocManager::install("decontam")
+
+```{r decontam_check}
+library(decontam)
+
+## Contamination removal: decontam combined method (frequency + prevalence) OR
+## present in ≥ blank_n_remove blanks.  Runs at summary minboot (minboots_summary).
+## Updates dat_filt in place; run before sum_by_taxa.
+##
+## Concentration source: extr_dna_conc. from sample_data tab (extracted DNA, pre-PCR).
+##   - Frequency test uses TRUE SAMPLES ONLY — blanks ignored (B. Callahan, decontam #88).
+##   - Prevalence test uses the neg vector independently of concentration.
+
+tax_cols    <- c("Kingdom", "Phylum", "Class", "Order", "Family", "Genus", "Species")
+decontam_idx <- which(grepl(paste0(";", minboots_summary, "$"), primers_minboot))
+
+# sample_id → extracted DNA concentration (lowercased in tidy chunk)
+conc_lookup <- sample_dat %>%
+  dplyr::select(sample_id, extr_dna_conc.) %>%
+  dplyr::distinct()
+
+## ── 1. run decontam ───────────────────────────────────────────────────────────
+decontam_res <- purrr::map(decontam_idx, function(i) {
+  primer_id <- primers_minboot[i]
+  meta      <- sam_list[[i]] %>%
+    dplyr::left_join(conc_lookup, by = "sample_id")
+
+  # samples × SVs matrix (rows = samples)
+  sv_mat <- t(as.matrix(dat_filt[[i]][, all_index_list[[i]]]))
+
+  neg  <- meta$type %in% c("extraction blank", "pcr blank")
+  # suppressWarnings: "<0.50 ng/mL" strings → NA by design
+  conc <- suppressWarnings(as.numeric(meta$extr_dna_conc.))
+  conc[is.na(conc) & !neg] <- decontam_conc_low   # below-detection samples
+  conc[is.na(conc) &  neg] <- decontam_conc_low   # blanks (not in sample_dat)
+
+  contam_df <- isContaminant(sv_mat, conc = conc, neg = neg,
+                             method = "combined", threshold = 0.1)
+  contam_df$primer_taxassign_id <- primer_id
+  contam_df
+})
+names(decontam_res) <- primers_minboot[decontam_idx]
+
+## ── 2. prepare plot data (built pre-filter so all SVs are visible) ────────────
+
+## p1_data: decontam scores stacked across primers for facet histogram
+p1_data <- purrr::imap_dfr(decontam_res, function(df, nm) {
+  dplyr::mutate(df, primer = nm)
+})
+
+## decontam_plot_data: inputs for decontam::plot_frequency (one entry per primer)
+decontam_plot_data <- lapply(seq_along(decontam_idx), function(j) {
+  idx  <- decontam_idx[j]
+  nm   <- names(decontam_res)[j]
+  meta <- sam_list[[idx]] %>%
+    dplyr::left_join(conc_lookup, by = "sample_id")
+  neg  <- meta$type %in% c("extraction blank", "pcr blank")
+  conc <- suppressWarnings(as.numeric(meta$extr_dna_conc.))
+  conc[is.na(conc)] <- decontam_conc_low
+  sv_mat <- t(as.matrix(dat_filt[[idx]][, all_index_list[[idx]]]))
+  # plot_frequency requires character column names — assign row names explicitly
+  # (default integer row names can be lost through matrix coercion)
+  colnames(sv_mat) <- as.character(rownames(dat_filt[[idx]]))
+  flagged <- which(decontam_res[[nm]]$contaminant)
+  top_svs <- if (length(flagged) > 0)
+    head(flagged[order(decontam_res[[nm]]$p[flagged])], 5) else integer(0)
+  # short taxonomy label for each top SV: "Genus Species (p=X)"
+  taxon_labels <- if (length(top_svs) > 0) {
+    paste0(
+      dat_filt[[idx]][top_svs, "Genus"], " ",
+      dat_filt[[idx]][top_svs, "Species"],
+      " (p=", round(decontam_res[[nm]]$p[top_svs], 3), ")"
+    )
+  } else character(0)
+  list(nm = nm, sv_mat = sv_mat, conc = conc, neg = neg,
+       top_svs = top_svs, taxon_labels = taxon_labels)
+})
+
+## ── 3. diagnostic tables (keep for future reference) ─────────────────────────
+
+## SVs flagged by decontam — full taxonomy + p-value
+decontam_flagged <- purrr::imap_dfr(decontam_res, function(df, nm) {
+  idx     <- which(primers_minboot == nm)
+  flagged <- which(df$contaminant)
+  if (length(flagged) == 0) return(NULL)
+  sv_sum  <- apply(dat_filt[[idx]][flagged, all_index_list[[idx]]], 1, sum)
+  dat_filt[[idx]][flagged, tax_cols] %>%
+    dplyr::mutate(primer_taxassign_id = nm,
+                  sample_reads        = sv_sum,
+                  decontam_p          = df$p[flagged]) %>%
+    dplyr::select(primer_taxassign_id, all_of(tax_cols), sample_reads, decontam_p)
+}) %>% dplyr::arrange(primer_taxassign_id, desc(sample_reads))
+
+## SVs present in ≥ 1 blank — shows how blank count varies across taxa
+blank_n_taxa <- purrr::map_dfr(seq_along(decontam_idx), function(j) {
+  idx <- decontam_idx[j]
+  nm  <- primers_minboot[idx]
+  if (length(blank_index_list[[idx]]) == 0) return(NULL)
+  blank_mat <- dat_filt[[idx]][, blank_index_list[[idx]], drop = FALSE]
+  n_blanks  <- rowSums(blank_mat > 0)
+  sv_sum    <- apply(dat_filt[[idx]][, sample_index_list[[idx]]], 1, sum)
+  dat_filt[[idx]] %>%
+    dplyr::select(all_of(tax_cols)) %>%
+    dplyr::mutate(primer_taxassign_id = nm,
+                  sample_reads        = sv_sum,
+                  n_blanks            = n_blanks) %>%
+    dplyr::filter(n_blanks >= 1)
+}) %>%
+  tidyr::separate(primer_taxassign_id, into = c("primer_pair", "minboot"),
+                  sep = ";", remove = FALSE) %>%
+  dplyr::select(primer_pair, all_of(tax_cols), sample_reads, n_blanks) %>%
+  dplyr::arrange(primer_pair, desc(n_blanks), desc(sample_reads))
+
+cat("\ndecontam flagged", nrow(decontam_flagged), "SVs\n")
+decontam_flagged
+
+cat("\nSVs appearing in ≥ 1 blank (n_blanks column; blank_n_remove =", blank_n_remove, "):\n")
+blank_n_taxa
+
+## ── 4. apply combined filter to dat_filt (all primer × minboot combinations) ─
+## decontam is run at summary minboot; flagged SV row names are matched by row
+## name across all minboot thresholds for the same primer pair.
+
+# build a named list: primer_pair → SV row names flagged by decontam
+decontam_sv_names <- setNames(
+  lapply(seq_along(decontam_idx), function(j) {
+    idx     <- decontam_idx[j]
+    flagged <- which(decontam_res[[j]]$contaminant)
+    row.names(dat_filt[[idx]])[flagged]
+  }),
+  sapply(primers_minboot[decontam_idx], function(x) strsplit(x, ";")[[1]][1])
+)
+
+for (i in seq_along(dat_filt)) {
+  primer_pair <- strsplit(primers_minboot[i], ";")[[1]][1]
+
+  # decontam-flagged SVs for this primer (from summary minboot run)
+  dc_sv <- if (primer_pair %in% names(decontam_sv_names))
+    decontam_sv_names[[primer_pair]] else character(0)
+
+  # SVs present in ≥ blank_n_remove blanks for this primer × minboot
+  if (length(blank_index_list[[i]]) > 0) {
+    blank_mat <- dat_filt[[i]][, blank_index_list[[i]], drop = FALSE]
+    n_blanks  <- rowSums(blank_mat > 0)
+    bl_sv     <- row.names(dat_filt[[i]])[n_blanks >= blank_n_remove]
+  } else {
+    bl_sv <- character(0)
+  }
+
+  # OR logic: remove if flagged by either method
+  remove_sv   <- union(dc_sv, bl_sv)
+  keep        <- !row.names(dat_filt[[i]]) %in% remove_sv
+  dat_filt[[i]] <- dat_filt[[i]][keep, ]
+
+  # update summary stats (used by summary_table chunk)
+  after_blank_filt[[i]]       <- length(row.names(dat_filt[[i]]))
+  after_blank_filt1[[i]]      <- apply(dat_filt[[i]][, all_index_list[[i]]], 2, sum)
+  after_blank_filt_SVsam[[i]] <- apply(dat_filt[[i]][, all_index_list[[i]]], 2,
+                                       function(x) sum(x > 0))
+}
+
+cat("\nContamination filter applied: decontam OR ≥", blank_n_remove, "blanks\n")
+cat("SVs remaining per primer (minboot =", minboots_summary, "):\n")
+for (nm in primers_minboot[decontam_idx]) {
+  cat(" ", nm, ":", after_blank_filt[[nm]], "SVs\n")
+}
+```
+
+## decontam plot 1: p-value distribution
+Run `decontam_check` first. One panel per primer.
+Good signal = spike near 0; flat = decontam could not find a signal.
+```{r decontam_plot1}
+ggplot2::ggplot(p1_data, ggplot2::aes(x = p)) +
+  ggplot2::geom_histogram(bins = 40, fill = "steelblue", colour = "white") +
+  ggplot2::geom_vline(xintercept = 0.1, colour = "red", linetype = "dashed") +
+  ggplot2::facet_wrap(~ primer, nrow = 1) +
+  ggplot2::labs(
+    title = "decontam p-value distribution (combined method, threshold = 0.1)",
+    x     = "decontam score (p)",
+    y     = "count"
+  ) +
+  ggplot2::theme_bw(base_size = 10) +
+  ggplot2::theme(strip.text = ggplot2::element_text(size = 7))
+```
+
+## decontam plot 2: one panel per top-flagged SV, proportion vs DNA concentration
+Contaminants should show higher proportion at LOW concentration.
+Blue circles = true samples; red triangles = blanks (plotted at x = -4).
+Facets = individual SVs (Genus Species + decontam p-value); primers with no
+flagged SVs are skipped with a message.  Single ggplot object → always renders.
+```{r decontam_plot2}
+p2_data <- purrr::map_dfr(decontam_plot_data, function(d) {
+  if (length(d$top_svs) == 0) {
+    message(d$nm, " \u2014 no contaminants flagged, skipping")
+    return(NULL)
+  }
+  # drop samples with zero total reads (avoids 0/0 in proportion)
+  keep     <- rowSums(d$sv_mat) > 0
+  sv_sub   <- d$sv_mat[keep, , drop = FALSE]
+  conc_sub <- d$conc[keep]
+  neg_sub  <- d$neg[keep]
+  log_conc <- ifelse(neg_sub, log10(1e-4), log10(conc_sub + 1e-4))
+  total    <- rowSums(sv_sub)
+
+  # one row per sample per top SV — each SV becomes its own facet panel
+  purrr::map_dfr(seq_along(d$top_svs), function(k) {
+    sv_reads <- sv_sub[, d$top_svs[k]]
+    data.frame(
+      taxon    = d$taxon_labels[k],
+      log_conc = log_conc,
+      prop     = ifelse(total > 0, sv_reads / total, NA_real_),
+      type     = ifelse(neg_sub, "blank", "sample")
+    )
+  })
+})
+
+ggplot2::ggplot(p2_data, ggplot2::aes(x = log_conc, y = prop,
+                                       colour = type, shape = type)) +
+  ggplot2::geom_point(size = 2.5, na.rm = TRUE) +
+  ggplot2::scale_colour_manual(values = c(sample = "steelblue", blank = "red")) +
+  ggplot2::scale_shape_manual(values  = c(sample = 16,          blank = 17)) +
+  ggplot2::facet_wrap(~ taxon, nrow = 1) +
+  ggplot2::labs(
+    title  = "Top 5 decontam-flagged SVs: proportion vs extracted DNA concentration",
+    x      = "log10(extracted DNA conc, ng/\u00b5l)",
+    y      = "proportion of reads",
+    colour = NULL, shape = NULL
+  ) +
+  ggplot2::theme_bw(base_size = 10) +
+  ggplot2::theme(legend.position = "top",
+                 strip.text = ggplot2::element_text(size = 7))
+```
+
+
+## sum by (clusters)/taxa
+ and also gather - first time in long form, but still in list with each df being miseq -
+
+```{r sum_by_taxa, echo=FALSE}
+# sum all reads for each unique taxon and !   gather !!
+
+ dat_filt_taxa<-dat_filt  # mes1<-dat_filt[[2]]  names(dat_filt)
+
+  #. >>>>>>> 1f43b52 (final for revision 1)
+### dummy lists
+  after_taxa_sum <- vector("list", length(names(dat_filt_taxa)))# for calc of lost SVs
+  names(after_taxa_sum) <- primers_minboot
+    after_taxa_sum_SV_sam <- vector("list", length(names(dat_filt_taxa)))# for calc of lost SVs
+  names(after_taxa_sum_SV_sam) <- primers_minboot
+
+# sum reads by unique taxa within unique miseq runs  and gather
+for (i in seq_along(dat_filt_taxa)){        # i<-12
+  dat_filt_taxa[[i]]<-dat_filt_taxa[[i]] %>% 
+   # mes1<-mes %>% 
+    dplyr::select(-seq.1,-seq) %>% # make sure all columns are numeric after group_by
+    ## unite(lineage, Superkingdom:Species, sep=";",remove=F) %>%
+    ## change for cluster
+    unite(lineage, c('Superkingdom','Kingdom','Phylum','Class','Order','Family','Class','Genus','Species', 'cluster'), sep=";",remove=F) %>%
+    #.  see above, but nothing else
+    dplyr::select(-Superkingdom,-Kingdom, -Phylum,-Class,-Order,-Family,-Genus,-Species, -cluster,-primer,-minboot) %>%  # 
+    group_by_at(vars(lineage,primer_taxassign_id)) %>% 
+    summarise_all(list("sum")) %>%   # get sum for all same taxa
+    pivot_longer(cols=starts_with("X"), names_to="miseq_sample_id", values_to="reads")  %>%
+    mutate(miseq_sample_id=gsub("X_","",miseq_sample_id) )  # add sample id column
+  
+  # get richnes of taxa per miseq/taxaassign
+    mes <- dat_filt_taxa[[i]] %>% 
+      filter(reads>0) 
+    after_taxa_sum[[i]]<- length(unique(mes$lineage))
+    # get richnes per sample
+    mes_s<-mes %>% 
+      group_by(primer_taxassign_id, miseq_sample_id) %>% 
+      summarize(SV=n())
+    after_taxa_sum_SV_sam[[i]]<- mes_s[,2:3]
+    
+    }   # names(mes)  mes1<-dat_filt[[2]]   mes<-dat_filt_taxa[[2]]  names(dat_filt_taxa[[3]])  mes<-x$seq[x$seq.1 %in% c(1,8,2)]
+          #  mes<- after_taxa_sum[[22]]  names(dat_filt_taxa)    mes<- after_taxa_sum_SV_sam[[11]]
+```
+
+
+
+
+## tidy 2
+bind data into one dataframe and add miseq sample data
+```{r gather}
+  ### simplify list into one dataframe and tidy    ##################################
+ dat_filt_taxa_df<-do.call(rbind,dat_filt_taxa)
+
+#  names(dat_filt_taxa_df)  names(sam2)   names(mes5)
+
+### merge with miseq sample data  - using sam2
+ dat_filt_taxa_df<-dat_filt_taxa_df %>% 
+  ungroup() %>% 
+   dplyr::rename(sample_num = miseq_sample_id) %>% 
+   separate(primer_taxassign_id, into=c("primer","minboot"), sep=";" , remove=FALSE) %>% 
+   mutate(sample_num= as.character(sample_num)) %>%  # make character to join wit sam2, change back last line?????
+  left_join(sam2) %>%  #, by=c("primer","sample_num")
+  mutate(sample_id_u=paste(primer,sample_id,minboot,sep=";")) %>% 
+  #mutate(primer_taxa_assign_id=paste(primer,minboot,sep="_")) %>% 
+  mutate(lineage2=make.names(lineage)) %>% 
+   mutate(lineage2=gsub('^X', '', lineage2)) %>% 
+   mutate(lineage2=gsub('^\\.+|\\.+$', '', lineage2)) %>%  # remove leading or trailing "."
+   group_by(sample_id_u) %>% 
+   mutate(sample_sum_after_filt=sum(reads)) %>%  # get sum reads per sample after filter
+   ungroup() 
+ #  unique(dat_filt_taxa_df$primer)
+#   mes<-dat_filt_taxa_df[dat_filt_taxa_df$primer_taxa_assign_id=="NA_NA",]  # unique(dat_filt_taxa_df$primer_taxa_assign_id)
+#  dat_filt_taxa_df$lineage2[1:10]
+  
+```
+
+
+
+## get min read calcs
+```{r set_mins_divs}
+
+# fac includes -per sample     reads, mean hab reads ,rich, div
+
+####      !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+#   !!!!!!!!! take a look at rare_mins, most in cores have very low     !!!!!!!!!!!!!!!!!!!!
+####      !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+### get summary number of reads per sample (only true samples).. for rarefy
+rare_mins<-dat_filt_taxa_df %>%   # names(dat_filt_taxa_df)
+  filter(type=="sample") %>% 
+  select(primer_taxassign_id, sample_id_u, reads) %>% 
+  group_by(primer_taxassign_id,sample_id_u) %>% 
+  summarise(sum_sample=sum(reads)) %>% 
+  group_by(primer_taxassign_id) %>% 
+  summarise(min_sample=min(sum_sample), low_quant=quantile(sum_sample, probs=0.25), seventyfivepercent_lower=0.75*low_quant, fiftypercent_lower=0.50*low_quant, low_10percent=quantile(sum_sample, probs=0.10), median=median(sum_sample), mean=mean(sum_sample),num_samp=n(),samp_below_quant= length(sum_sample[sum_sample<low_quant]), samp_below_75= length(sum_sample[sum_sample<seventyfivepercent_lower]), samp_below_50= length(sum_sample[sum_sample<fiftypercent_lower]), samp_below_10p= length(sum_sample[sum_sample<low_10percent]))
+#   !!!!!!!!! take a look, most in cores have very low rare to 3000 remove any sample less than 1000
+# Feb 2021, try to automate rarefy decision.....
+#  seems like fair trade off between being too stringent for min. reads and removing samples with fewer reads than min ..
+#   use lower quartile (75% of samples) for minimum for rarefaction and then remove 10% of samples with low reads.
+##  this results in about 10% samples removed and 10% of samples have reads below rarefaction minumum.
+
+##   !!!!!!!!!!!!!!!!!!!
+#   set min and remove_sample
+#  min_num_rarefaction<-3000
+#   sample_read_min<-1000
+#  BETTER  !!!!!!    or set rare and min for each miseq run     # names(rare_mins)
+min_num_rarefaction<-as.vector(rare_mins$low_quant) 
+sample_read_min<-as.vector(rare_mins$fiftypercent_lower) 
+```
+
+
+
+## rarify and diversity measures
+
+```{r rar_and_div}
+###  rarify  and simpson diversity ???    names(rar)    x<-rar[[12]]     x2<-rar2[[2]]
+mes<-dat_filt_taxa_df %>% 
+  #  distinct(sample_id_u)
+  filter(grepl("NA",sample_id_u))
+
+## make list from data frame by primer and taxa assign id
+dftd<-dat_filt_taxa_df %>% 
+    select(primer_taxassign_id,sample_id_u, sample_id,lineage2,reads) %>% 
+    split(list(.$primer_taxassign_id))
+
+
+
+## rarify
+rar2<-dftd
+nam_rar2<-names(rar2)
+j<-0  # i<-1
+# fix taxonomy of insect    match insect name to dada2 nameing
+for (i in nam_rar2){
+     x<-rar2[[i]] #  i<-5
+      j<-j+1 # for changing minimum sample size -min_num_rarefaction
+
+  x1<-dplyr::select(x,sample_id_u,lineage2, reads)
+  x1<-pivot_wider(x1, names_from=lineage2, values_from=reads, values_fill=0) # pivot so samples are rows
+  ## get min number of reads per .. s
+        #nn<-cbind(x1$sample_id_u,rowSums(x1[,-1])) 
+        #nn<-data.frame(nn)
+        #colnames(nn) <- c("sample_id", "r_sum")
+        #nn$r_sum<-as.numeric(as.character(nn$r_sum)) #  hist(nn$r_sum[nn$r_sum<50000])   sum(nn$r_sum)*0.005
+        #s_true<-min(nn$r_sum)  ## find min reads for rarefy
+        #s<-ifelse(s_true<min_num_rarefaction,min_num_rarefaction,s_true)
+  ###  rarefy
+  x2<-data.frame(vegan::rrarefy(x1[,-1],sample=min_num_rarefaction[j]), check.names = FALSE)
+  # fix incase nothing assigned  !!!!!!
+  if (nrow(x2)<2) {
+    x21<-data.frame(t(x2))
+    x3<-bind_cols(x1[,1],x21)
+  } else{ x3<-bind_cols(x1[,1],x2)}
+  x4<-pivot_longer(x3, cols=-sample_id_u, names_to="lineage2", values_to="rare_reads") #
+  rar2[[i]]<-x4
+}
+
+rar3<-bind_rows(rar2, .id = "primer_taxassign_id")  # combine rarified lists
+
+## rarified diversity
+rar_div<-lapply(rar2, function(x) { 
+  #  x<-rar2[[12]]
+  x1<-select(x,sample_id_u,lineage2, rare_reads)
+  x1<-pivot_wider(x1, names_from=lineage2, values_from=rare_reads, values_fill=0)
+  s<-min(rowSums(x1[,-1]))
+  x2<-data.frame(vegan::diversity(x1[,-1],index = "shannon"))
+  #x3<-bind_cols(x1[,1],x2)
+    # fix incase nothing assigned  !!!!!!
+  if (nrow(x2)<2) {
+    x3<-x1[,1]
+    x3$NA.NA<-NA # if nothing IDed, then diversity is NA
+  } else{ x3<-bind_cols(x1[,1],x2)}
+  names(x3)[2]<-"shan_div_rare" # 
+  x<-x3
+})
+rar_div2<-bind_rows(rar_div, .id = "primer_taxassign_id") # combine diveristy lists
+
+## real diversity
+div<-lapply(dftd, function(x) { 
+  #  x<-rar2[[12]]
+  x1<-select(x,sample_id_u,lineage2, reads)
+  x1<-pivot_wider(x1, names_from=lineage2, values_from=reads, values_fill=0)
+  s<-min(rowSums(x1[,-1]))
+  x2<-data.frame(vegan::diversity(x1[,-1],index = "shannon"))
+  #x3<-bind_cols(x1[,1],x2)
+    # fix incase nothing assigned  !!!!!!
+  if (nrow(x2)<2) {
+    x3<-x1[,1]
+    x3$NA.NA<-NA # if nothing IDed, then diversity is NA
+  } else{ x3<-bind_cols(x1[,1],x2)}
+  names(x3)[2]<-"shan_div" # 
+  x<-x3
+})
+div2<-bind_rows(div, .id = "primer_taxassign_id") # combine diveristy lists
+
+##  combine rare data     names(dat6)
+dat_filt_taxa_df<-dat_filt_taxa_df %>% 
+  left_join(rar3) %>%  ## unique(dat5$primer_taxassign_id)  unique(rar3$primer_taxassign_id)
+  left_join(rar_div2) %>%
+  left_join(div2) %>%
+  select(-lineage2)
+
+### richness and rarefied richness
+rich<-dat_filt_taxa_df %>% 
+  select(primer_taxassign_id,sample_id_u,lineage,reads,rare_reads) %>% 
+  group_by(primer_taxassign_id,sample_id_u) %>% 
+  summarise(rich=length(reads[reads>0]),rich_rare=length(rare_reads[rare_reads>0]))
+
+## join back in
+dat_filt_taxa_df1<-dat_filt_taxa_df %>% 
+  left_join(rich)
+
+#dat5<-delete.na(dat4, 4)      unique(dat)
+
+```
+
+
+
+## add sample info.
+```{r sample_dat}
+## this is the first use of sample_data from all data excel
+## this add sample info with big df
+#   names(dat_filt_taxa_df)    names(sample_dat)
+#   use sample_ID in case plate layout (sample_num) changed among primers
+# remove sample_num from sample_dat to ensure good join
+sample_dat1 <- sample_dat  %>% 
+    dplyr::select(-sample_id_old1)  ### likely remove for other studies
+  
+  # add in sample information
+ dat_filt_taxa_df2 <- dat_filt_taxa_df1 %>% 
+    left_join(sample_dat1)
+  
+  
+```
+
+
+
+## summary_tables
+does not use dat_filt_taxa_df1
+
+```{r summary_table}
+
+# !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+# WARNING: this chunk modifies after_n_occurance_per_sample1, after_min_sample_filt1,
+# after_blank_filt1, after_taxa_clean1, after_taxa_clean1_SVsam, after_min_sample_filt_SVsam,
+# after_blank_filt_SVsam, and after_taxa_sum_SV_sam IN PLACE (overwrites the original lists).
+# If you re-run this chunk you MUST first re-run:
+#   1. `filter` chunk (line 387)   -- rebuilds all after_* filter summary lists
+#   2. `sum_by_taxa` chunk (line 515) -- rebuilds after_taxa_sum_SV_sam
+# Failing to do so will corrupt the primer_taxassign_id values and produce empty output tables.
+# !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
+# tidy summary of read changes from dada2 pipe
+  #  names(summar)       mes1<-summar[[1]]
+
+## use sample_sam to join correct numbers and sample_id  -- set above, don't rerun
+# dat_in_id<- c("Dammam__18s_stoeck_summary","Dammam__co1_summary")
+
+dada_summary<-summar %>% 
+    purrr::map(data.frame) %>% 
+    bind_rows(. , .id = "primer_taxassign_id") 
+
+
+dada_summary2 <- dada_summary %>%   # names(dada_summary2)
+  select(-tabled) %>% 
+  # warning OK -- ignore
+  #  need to check depending on study label
+  #separate(primer_taxassign_id, into=c("study","primer_pair1","primer_pair2", "remove")  , sep="_", remove=FALSE) %>%   # 
+  separate(primer_taxassign_id, into=c("study","remove1","primer_pair1","primer_pair2", "remove")  , sep="_", remove=FALSE) %>%   # 
+  
+  mutate(primer_pair= if_else(primer_pair2=="18s","18s_stoeck", primer_pair2)) %>% 
+  select(-remove, -remove1, -study, -primer_pair1, -primer_pair2, -primer_taxassign_id) %>% 
+  dplyr::rename(primer_removed = input , denoised = denoised, FandR_merged=merged, bimeras_removed=nonchim)
+  
+
+##  for reads
+#   mes1<-mes[[1]]
+##     get summery per sample    ####
+# 
+## helper: convert a named vector to a tidy 2-col data frame
+## tibble::enframe() avoids the auto-naming issue in data.frame() + rownames_to_column()
+vec_to_df <- function(x) {
+  tibble::enframe(as.numeric(x), name = "sample_num", value = "value")
+}
+
+nnn <- "after_n_occurance_per_sample"
+mes <- after_n_occurance_per_sample1
+mes <- purrr::map(mes, vec_to_df)
+mes <- bind_rows(mes, .id = "primer_taxassign_id")
+names(mes)[3] <- nnn
+after_n_occurance_per_sample1 <- mes
+
+nnn <- "after_min_sample_filt"
+mes <- after_min_sample_filt1
+mes <- purrr::map(mes, vec_to_df)
+mes <- bind_rows(mes, .id = "primer_taxassign_id")
+names(mes)[3] <- nnn
+after_min_sample_filt1 <- mes
+
+nnn <- "SV_after_min_sample_filt"
+mes <- after_min_sample_filt_SVsam
+mes <- purrr::map(mes, vec_to_df)
+mes <- bind_rows(mes, .id = "primer_taxassign_id")
+names(mes)[3] <- nnn
+after_min_sample_filt_SVsam <- mes
+
+nnn <- "after_blank_filt"
+mes <- after_blank_filt1
+mes <- purrr::map(mes, vec_to_df)
+mes <- bind_rows(mes, .id = "primer_taxassign_id")
+names(mes)[3] <- nnn
+after_blank_filt1 <- mes
+
+nnn <- "SV_after_blank_filt"
+mes <- after_blank_filt_SVsam
+mes <- purrr::map(mes, vec_to_df)
+mes <- bind_rows(mes, .id = "primer_taxassign_id")
+names(mes)[3] <- nnn
+after_blank_filt_SVsam <- mes
+
+nnn <- "after_taxa_clean"
+mes <- after_taxa_clean1
+mes <- purrr::map(mes, vec_to_df)
+mes <- bind_rows(mes, .id = "primer_taxassign_id")
+names(mes)[3] <- nnn
+after_taxa_clean1 <- mes
+
+nnn <- "SV_after_taxa_clean"
+mes <- after_taxa_clean1_SVsam
+mes <- purrr::map(mes, vec_to_df)
+mes <- bind_rows(mes, .id = "primer_taxassign_id")
+names(mes)[3] <- nnn
+after_taxa_clean1_SVsam <- mes
+
+## after_taxa_sum_SV_sam elements are grouped tibbles (primer_taxassign_id, miseq_sample_id, SV)
+## use imap_dfr to select columns by name and strip grouping before binding
+after_taxa_sum_SV_sam <- purrr::imap_dfr(
+  after_taxa_sum_SV_sam,
+  function(df, nm) {
+    df <- as.data.frame(df)              # strip grouping attribute
+    if (nrow(df) == 0) return(NULL)      # skip empty elements (e.g. insect assignments)
+    data.frame(
+      primer_taxassign_id = nm,
+      sample_num          = as.integer(df$miseq_sample_id),
+      SV_after_taxa_sum   = df$SV
+    )
+  }
+)
+
+
+## combine all tables
+filter_summary_per_sample<-after_n_occurance_per_sample1 %>%    # names(filter_summary_per_sample)
+  left_join(after_min_sample_filt1) %>%
+  left_join(after_blank_filt1) %>% 
+  left_join(after_taxa_clean1) %>% 
+  #
+  left_join(after_min_sample_filt_SVsam) %>% 
+  left_join(after_blank_filt_SVsam) %>% 
+  left_join(after_taxa_clean1_SVsam) %>%
+  #
+  mutate(sample_num= as.numeric( gsub('X_', '', as.character(sample_num))) ) %>%  # remove "X_" from sample_num
+  #
+  left_join(after_taxa_sum_SV_sam) %>%
+  #
+  separate(primer_taxassign_id, into=c("primer_pair", "taxa_assign")  , sep=";", remove=FALSE) %>%   # split primer_taxassign_id to match with dada2_summary     names(filter_summary_per_sample)
+  mutate(sample_num=as.character(sample_num)) %>% # need for next join
+  left_join(dada_summary2) %>% 
+  mutate(sample_num=as.numeric(sample_num))  %>% # change back for consistancy
+  select(primer_taxassign_id,primer_pair,taxa_assign,sample_num, primer_removed, filtered, 
+         denoised, FandR_merged, bimeras_removed, 
+         after_n_occurance_per_sample, after_min_sample_filt, after_blank_filt , after_taxa_clean,
+         SV_after_min_sample_filt, SV_after_blank_filt, SV_after_taxa_clean, SV_after_taxa_sum)   # reorder columns
+
+
+###########################
+## clculate unique SV's after filters per miseq/taxaassign
+## these have 1 number per miseq Removed Feb. 24, 2020!!!, if need go to Dammam scripts ?????
+
+## TO DO ----- remove the following from above..
+mes<-after_n_occurance_per_sample    # mes2<-mes[[1]] names(mes)
+mes<-after_blank_filt
+mes<-after_min_sample_filt
+mes<-after_taxa_clean
+mes<-after_taxa_sum
+
+
+###########################################
+#### combine all filtering into per primer/taxa assign     ####    unique(filter_summary_per_primer_minboot$sample_id_simple)
+filter_summary_per_primer_minboot <- filter_summary_per_sample %>%  #   names(filter_summary_per_primer_minboot)
+    left_join(sample_sam[,1:5], by = c("primer_pair" = "id", "sample_num" = "sample_num") ) %>%   # join with smaple_sam to get consistant sample names
+    filter( !(type=="mock" | type =="positive control")) %>%  ## remove moc  unique(filter_summary_per_primer_minboot$type)
+    mutate(type2=if_else(type =="extraction blank" | type=="pcr blank", "blanks", "samples", type)) %>% #unique(filter_summary_per_primer_minboot$type)
+    group_by(primer_taxassign_id, primer_pair, taxa_assign, type2)  %>% 
+    #summarize_at(vars(primer_removed:after_taxa_clean), sum) %>% 
+    summarise(across(primer_removed:SV_after_taxa_sum,
+                     list(mean=~mean(., na.rm=TRUE), se=~plotrix::std.error(.)))) %>%
+  ## add data on unique SV per miseq  ??  - no  !! removed
+    #left_join(after_n_occurance_per_sample) %>% 
+    #left_join(after_min_sample_filt)  %>% 
+    #left_join(after_blank_filt) %>%  
+    #left_join(after_taxa_clean) %>% 
+    #left_join(after_taxa_sum)     %>% 
+    #left_join(primer_names)     %>%  # add good primer names
+    #select(-primer_pair) %>%   # names(filter_summary_per_primer_minboot)
+    dplyr::rename(eDNA = type2, primers = primer_pair) %>% 
+    filter(taxa_assign %in% minboots_summary) %>%  ###    !!!!!   remove insect !!!!!!
+    # filter(primers %in% primers_summary) %>%  ###    !!!!!   keep used primers !!!!!!
+    #mutate(primers=factor(primers, levels= primers_summary)) %>% 
+    arrange(primers, desc(taxa_assign), desc(eDNA) )
+  
+
+#################### makes summary tables to then be exported
+# names(filter_summary_per_primer_minboot)
+
+DADA<-filter_summary_per_primer_minboot %>% 
+    ungroup() %>% 
+    distinct(primers,eDNA, .keep_all = TRUE) %>% 
+    select(primers,eDNA,primer_removed_mean, primer_removed_se,filtered_mean,filtered_se,denoised_mean,denoised_se,
+           FandR_merged_mean,FandR_merged_se,bimeras_removed_mean,bimeras_removed_se) %>% 
+   arrange(primers, desc(eDNA) )
+  
+
+# if filtered by minimum number of samples then --   after_min_sample_filt_mean  and    unique_SV_after_min_sample_filt
+post_DADA_sum<-filter_summary_per_primer_minboot %>% 
+    ungroup() %>% 
+    select(primers,taxa_assign, eDNA, after_n_occurance_per_sample_mean, after_n_occurance_per_sample_se,
+           after_blank_filt_mean, after_blank_filt_se, after_taxa_clean_mean, after_taxa_clean_se,
+           SV_after_min_sample_filt_mean,SV_after_min_sample_filt_se, 
+           SV_after_blank_filt_mean,  SV_after_blank_filt_se,
+           SV_after_taxa_clean_mean, SV_after_taxa_clean_se,
+           SV_after_taxa_sum_mean, SV_after_taxa_sum_se ) %>%  
+   arrange(primers, desc(taxa_assign), desc(eDNA))
+
+
+
+
+```
+
+
+
+## export unfilt data
+```{r export_1}
+
+# unfilter data
+#saveRDS(dat3, Dammam_data_not_filtered)
+data.table::fwrite(dat_filt_taxa_df2,paste(dir,export_file,export_name,sep=""),row.names=FALSE, sep=",")
+
+# summary tables
+sjPlot::tab_df(DADA, alternateRowColors=FALSE, describe=FALSE,digits = 0, file=paste(dir,summary_file,"/DADA2_read_summary.html",sep="") )
+ 
+sjPlot::tab_df(post_DADA_sum, alternateRowColors=FALSE, describe=FALSE,digits = 0, file=paste(dir,summary_file,"/Post_DADA2_read_summary.html",sep="")  )
+
+```
+
+
+## Session info
+Records R version and exact package versions used — important for reproducibility.
+```{r session_info}
+sessionInfo()
+```
+
+

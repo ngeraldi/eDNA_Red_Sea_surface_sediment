@@ -1,0 +1,3159 @@
+---
+title: "Red Sea surface - eukaryote analysis and plots"
+author: "Nathan R. Geraldi"
+date: "2026 update"
+output: github_document
+---
+
+set table options
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## renv — package version locking
+To lock exact package versions for reproducibility, run once from the R console
+after all packages are installed and working:
+```r
+# renv::init()     # first time: initialise and snapshot
+# renv::snapshot() # after adding/updating packages
+# renv::restore()  # collaborators run this to install exact same versions
+```
+Do NOT run renv::init() mid-analysis — do it when the project is stable and
+ready for GitHub. The renv.lock file should be committed to the repository.
+
+## Libraries
+```{r libraries, message=FALSE, warning=FALSE}
+library(here)        # robust paths relative to .Rproj root
+library(RColorBrewer)
+library(vegan)
+library(fields)
+library(psych)
+library(tidyverse)
+library(broom)
+library(ade4)        # for RLQ and fourth-corner analysis
+
+
+
+# for maps
+library(sf)
+library(rnaturalearth)
+library(rnaturalearthdata)
+library(rnaturalearthhires)
+library(ggrepel)
+library(ggspatial)
+library(ggplot2)
+library(forcats)
+
+# for stats
+library(lme4)
+library(lmerTest)
+library(car)
+library(spdep)
+library(spatialreg)
+library(mvabund)     # manyglm — multivariate GLM for community × env
+library(mgcv)        # GAM (used inside ordisurf)
+library(knitr)       # kable tables
+library(kableExtra)  # kable styling (bold/highlight significant rows)
+library(patchwork)   # multi-panel figure layout (sampling map)
+library(ggvenn)      # Venn diagrams (habitat overlap)
+library(ggtext)      # element_markdown() for coloured axis labels
+library(wesanderson) # colour palettes (Zissou1, Moonrise2) matching Arctic paper
+## marmap + terra loaded inside through_water_dist chunk only (terra masks dplyr verbs)
+library(flextable)   # Word-ready tables (Table 1, Table 2)
+
+
+select <- dplyr::select  # mask MASS::select which conflicts when both packages loaded
+
+```
+
+## Functions
+```{r functions, message=FALSE, warning=FALSE}
+# function to remove rows with n number of NA's
+delete.na <- function(DF, n=0) {
+  DF[rowSums(is.na(DF)) <= n,]
+}
+
+# Specify alpha as a percentage:
+colorRampAlpha <- function(..., n, alpha) {
+   colors <- colorRampPalette(...)(n)
+   paste(colors, sprintf("%x", ceiling(255*alpha)), sep="")
+}
+
+```
+
+
+## Universal variables
+```{r define_universal}
+stud_pat <- "RS_surface"
+
+## All inputs, outputs, and plots live in the '2026 RS eDNA' folder.
+dir         <- paste0(here::here("2026 RS eDNA"), "/")
+export_file <- ""       # CSV exports → dir  (empty = same as dir)
+## out_file not currently used; kept as placeholder for future summary exports
+plot_file   <- "plots"  # plots subfolder: dir/plots/
+
+# filtered sequence data (output of post-DADA2 Rmd)
+dat_name <- paste0(stud_pat, "_filtered_data_all.csv")
+
+
+## set some other universal variables
+####  !!!! need to be in alphabetical order - tabs in sam_file should match these names too !!!!! also have "type"" column
+primers <- c('18smini', "euka02")   # 18S_V9 and 18S_V7 only
+n_primers <- length(primers)
+## must be in alphabetical order
+minboots<-c("insect",50,70,90)  # for getting all data minboots and insect data
+min_insect_score<-0.80# set minimum score for insect taxa score
+
+####  !!!! set minimum reads per sample to remove  !!!!!   ####
+# min_reads_per_sample<- 1
+# now use chunk below to determine
+
+################### set file path and name of sample data
+## each primer should have own sheet with name matching primers
+## primer sheets first then location sheet (1 row per each sample location), then other sheets with relevent data
+sam_file_path <- paste0(dir, "RS_surface_sample_data_all.xlsx")
+
+
+# lineage names used in tidyr::separate calls
+# cluster_num is stripped from lineage strings early in the tiding chunk,
+# so it is NOT included here — keeps tl and the 8-field lineage in sync.
+tl <- c("Superkingdom","Kingdom", "Phylum", "Class", "Order", "Family", "Genus", "Species")
+
+
+## for colors
+## for distinct colors!
+color = grDevices::colors()[grep('gr(a|e)y', grDevices::colors(), invert = T)]
+# choose # of colors
+n=15
+# pie(rep(1,n), col=sample(color, n))   # colour preview — comment out for knit
+#######!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+##  best from here -- https://medialab.github.io/iwanthue/
+## colo — 15 distinct colours from iwanthue; available if needed for exploratory plots
+colo=c("#7f265b","#5dbb68","#58388b","#9eb13f","#677fd8","#ca913b","#bc80d5","#45bc8d","#c9417e","#36dee6","#ba4758","#758a3c","#c25bac","#b75636","#da75a0")
+# pie(rep(1,n), col=colo)
+
+
+```
+
+## Get maps
+```{r get_maps}
+# define map - Red Sea / Middle East region
+world <- rnaturalearth::ne_countries(scale='medium', returnclass = 'sf')
+me    <- rnaturalearth::ne_countries(scale='large', continent = 'Asia', returnclass = 'sf')
+sa    <- rnaturalearth::ne_countries(scale='large', country = 'Saudi Arabia', returnclass = 'sf')
+```
+
+
+## Import data
+
+```{r import}
+# sample data -- will need Quality control !!! make sure sample_se make sense
+
+#  import taxonomy assigned to sequences    names(dat)
+dat<-data.table::fread(file=paste(dir,export_file,dat_name, sep=""), sep=",")
+
+##   import trait data — cleaned version produced by Red_sea_trait_cleaning.Rmd
+trait_dat <- data.table::fread(paste0(dir, "Red_sea_eDNA_traits_cleaned.csv"))
+
+## import env data
+env <- data.table::fread(file = paste0(dir, "Red_sea_eDNA_enviro_var.csv"), sep = ",")
+
+
+```
+
+
+## Set minimum reads
+```{r set_mins_divs}
+
+# fac includes -per sample     reads, mean hab reads ,rich, div
+
+####      !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+#   !!!!!!!!! take a look at rare_mins, most in cores have very low     !!!!!!!!!!!!!!!!!!!!
+####      !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+### get summary number of reads per sample (only true samples).. for rarefy
+rare_mins<-dat %>%   # names(dat_filt_taxa_df)
+  filter(type=="sample") %>% 
+  dplyr::select(primer_taxassign_id, sample_id_u, reads) %>% 
+  group_by(primer_taxassign_id,sample_id_u) %>% 
+  summarise(sum_sample=sum(reads)) %>% 
+  group_by(primer_taxassign_id) %>% 
+  summarise(min_sample=min(sum_sample),upper_quant=quantile(sum_sample, probs=0.75),  low_quant=quantile(sum_sample, probs=0.25), seventyfivepercent_lower=0.75*low_quant, fiftypercent_lower=0.50*low_quant, one_third_lower=0.333*low_quant, low_10percent=quantile(sum_sample, probs=0.10), lower_wisker= low_quant -( (upper_quant-low_quant)*0.5 ) , median=median(sum_sample), mean=mean(sum_sample),num_samp=n(),samp_below_quant= length(sum_sample[sum_sample<low_quant]), samp_below_75= length(sum_sample[sum_sample<seventyfivepercent_lower]), samp_below_50= length(sum_sample[sum_sample<fiftypercent_lower]), samp_below66 = length(sum_sample[sum_sample < one_third_lower]) , samp_below_10p= length(sum_sample[sum_sample<low_10percent]), samp_below_wisk= length(sum_sample[sum_sample<lower_wisker]))
+#   !!!!!!!!! take a look, most in cores have very low rare to 3000 remove any sample less than 1000
+# Feb 2021, try to automate rarefy decision.....
+#  seems like fair trade off between being too stringent for min. reads and removing samples with fewer reads than min ..
+#   use lower quartile (75% of samples) for minimum for rarefaction and then remove 10% of samples with low reads.
+##  this results in about 10% samples removed and 10% of samples have reads below rarefaction minumum.
+
+##   !!!!!!!!!!!!!!!!!!!
+#   set min and remove_sample
+#  min_num_rarefaction<-3000
+#   sample_read_min<-1000
+#  BETTER  !!!!!!    or set rare and min for each miseq run     # names(rare_mins)
+min_reads_min<-rare_mins[,c(1,4,6)]
+min_num_rarefaction<-as.vector(rare_mins$low_quant)
+sample_read_min<-as.vector(rare_mins$fiftypercent_lower)
+
+# The data-driven threshold (50% of Q1) gives 4713 (18smini) and 4851 (euka02).
+# A fixed cutoff of 4500 is used instead: two borderline samples were excluded
+# by the data-driven threshold despite one primer performing well (>24000 reads):
+#   DC 2017 M D1 (Mangrove): euka02 = 4564 reads, 18smini = 32635 reads
+#   DC 2017 S6   (Seagrass): 18smini = 4520 reads, euka02 = 24129 reads
+# Both samples are just below the data-driven threshold for one primer only;
+# the other primer has excellent coverage. A cutoff of 4500 recovers both
+# without altering the status of any other sample.
+min_reads_min <- min_reads_min %>%
+  mutate(fiftypercent_lower = 4500)
+```
+
+## Replicate analysis
+```{r rep_anal}
+## Placeholder — no replicate samples in this dataset; chunk reserved for future use.
+
+
+```
+
+
+
+
+
+
+## Tidy data
+
+```{r tiding}
+
+# make simple sample names  -- new names unique for all samples - not done before
+sample_names_good <- dat %>%    #   names(dat)
+  filter(!duplicated(sample_id_u))  %>% 
+  select(sample_id_u) %>% 
+  mutate(num=1:length(row.names(.)), sample_id_meta=paste("x_",num,sep="")) %>% 
+  select(-num)
+
+
+## tidy env data
+## CSV has both non-near (grid-cell) and _near (nearest-cell) versions of each
+## variable. Drop the non-near versions and rename _near to short working names.
+## NOTE: the _near columns have a SPACE before the underscore in their names
+## (e.g. "Present.Surface.Temperature.Mean _near") — backticks required.
+## Use dplyr::rename() explicitly in case terra is ever loaded (it masks rename).
+env <- env %>%   # names(env)
+  select(
+    -land_distance,
+    -`Present.Surface.Temperature.Mean`,
+    -`Present.Surface.Temperature.Range`,
+    -`Present.Surface.Primary.productivity.Mean`,
+    -`Present.Surface.Primary.productivity.Range`,
+    -`Present.Surface.Salinity.Mean`,
+    -`Present.Surface.Nitrate.Mean`,
+    -`Present.Surface.Par.Mean`
+  ) %>%
+  dplyr::rename(
+    sst_mean      = `Present.Surface.Temperature.Mean _near`,
+    SST_range     = `Present.Surface.Temperature.Range _near`,
+    pp_mean     = `Present.Surface.Primary.productivity.Mean _near`,
+    pp_range    = `Present.Surface.Primary.productivity.Range _near`,
+    salinity      = `Present.Surface.Salinity.Mean _near`,
+    nitrate       = `Present.Surface.Nitrate.Mean _near`,
+    PAR           = `Present.Surface.Par.Mean _near`,
+    land_distance = land_distance_near
+  )
+
+
+
+###      tidy sequence data
+ # unique(sample_age1$dating_type)
+dat_all<- dat %>%   # names(dat)   names(dat_all)
+  filter(reads>0) %>%
+
+  ## strip XML artifact prefix from sample_id — the sequence CSV has
+  ## 'xml:space="preserve">' (or double-quote-escaped variant) prepended to
+  ## CCF sample IDs. Match everything up to and including the first '>',
+  ## then trim whitespace to catch trailing spaces left after stripping.
+  mutate(sample_id = stringr::str_trim(
+    stringr::str_remove(sample_id, '^xml:space[^>]*>')
+  )) %>%
+
+  ## ── Strip numeric cluster suffix from lineage ─────────────────────────────
+  ## The decon version of post_DADA2_filter_and_tidy.Rmd appends a DECIPHER
+  ## cluster number as the final ;-delimited field (e.g. "...;Genus sp;-42").
+  ## Check whether the last field is purely numeric (incl. optional leading "-")
+  ## and remove it if so — otherwise leave the lineage unchanged.
+  ## Must happen FIRST: different primers get different cluster IDs for the same
+  ## taxon, so the suffix blocks correct collapsing across primers downstream.
+  mutate(lineage = stringr::str_replace(lineage, ";-?\\d+$", "")) %>%
+
+  mutate(type_3cat=forcats::fct_recode(type, "blank"="extraction blank", "blank" = "pcr blank", "mock" = "positive control")) %>%
+  
+  #mutate(ybp_cat=cut(ybp, breaks=c(-Inf,10,50,100,250,500, Inf),labels=c("<10","10-50","50-100","100-250","250-500",">500"))) %>%  
+
+  #mutate(ybp_cat_blanks=if_else(is.na(ybp_cat), type_3cat  , ybp_cat )) %>% # bring blanks into age cat
+    # unique(dat2$ybp_cat_blanks)
+  mutate(percent_reads=reads/sample_sum_after_filt*100)  %>% 
+  mutate(log_reads=log(reads+1), log_rare_reads=log(rare_reads+1), log_percent_reads=log(percent_reads+1) )  %>% 
+    mutate(primer=forcats::fct_recode(primer, "18S_V7"="euka02", "18S_V9"="18smini","CO1"="co1", "Vert"="vert")) %>% # "18S_V4"="18s_stoeck"
+  mutate(primer_name=factor(primer,levels=c("18S_V9","18S_V7","CO1","Vert","rbclmini"))) %>% # ,"18S_V4"
+
+  ## get new/good sample names
+  left_join(sample_names_good)
+
+#    !!!!!!!!
+#    !!!!!!!!!!!!!!!!!!!!!!!!!   limit  ??????????????    !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+# final filtering, make df with 18s
+dat_all_filt <- dat_all %>%    
+    filter(minboot==70) %>% 
+   # filter(primer!="rbclmini") %>% 
+   # filter(primer!="Vert") %>% 
+
+  filter(grepl("18S", primer)) %>%   # "18S"  "18S_V9"
+  mutate(primer=factor(primer)) %>%   # levels(x$primer)
+  
+  # remove reps
+  filter(!grepl("rep", sample_id)) %>% 
+  # only samples
+  filter(type=="sample") %>% 
+
+    ## !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+    ## remove samples with minimal reads — fixed cutoff of 4500 reads
+    ## (data-driven 50% Q1 gives 4713 / 4851; lowered to recover two
+    ##  borderline samples with one strong and one near-threshold primer)
+  left_join(min_reads_min)  %>%  # names(min_reads_min)
+  filter(sample_sum_after_filt > fiftypercent_lower) %>%
+  select(-low_quant, -fiftypercent_lower) %>%
+
+    ## !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+    ## change % reads to rarefied % !!!!!!!  !!!!!!!!!!!!!!!!!!!!!!!!!
+  group_by(sample_id, primer) %>%
+  mutate(rare_reads_sum=sum(rare_reads)) %>%
+  mutate(percent_reads = rare_reads/rare_reads_sum)
+  # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
+## ── Remove non-marine / contaminant taxa ─────────────────────────────────────
+## Applied here so all downstream objects (euk_phylum, euk_order, and the
+## per-primer supplementary figures) are clean.
+## Join key mismatch: data lineages start with "Eukaryota;" (Superkingdom field
+## from tl), but trait_dat lineages start at Kingdom ("Animalia;..."). Strip the
+## leading superkingdom field into a temporary column for the join only.
+dat_all_filt <- dat_all_filt %>%
+  ungroup() %>%
+  mutate(.lj = sub("^[^;]+;", "", lineage)) %>%
+  left_join(dplyr::select(trait_dat, lineage, not_marine_contam),
+            by = c(".lj" = "lineage")) %>%
+  dplyr::filter(is.na(not_marine_contam) | not_marine_contam != 1) %>%
+  dplyr::select(-not_marine_contam, -.lj)
+
+
+# get list of samples that have both primers - some samples removed by low reads, then use below
+samples_both_prim <- dat_all_filt %>% 
+      distinct(primer,sample_id) %>% 
+      group_by(sample_id) %>% 
+      summarise(num_primers_sample=n()) %>% 
+      filter(num_primers_sample >1)
+
+
+
+
+# tidy above to make one df of all taxa present for both primers
+# cluster_num was stripped above so same taxon from both primers now shares
+# the same lineage string and collapses correctly in the group_by.
+# percent_reads = MEAN across primers (average signal across primers for each taxon).
+dat_all_filt_combine_prim <- dat_all_filt %>%   # names(dat_all_filt)
+  group_by(lineage, sample_id, type, date, year, season, area, habitat, lat, lon, depth) %>%
+  summarize(
+    percent_reads    = mean(percent_reads),
+    count_of_primers = n_distinct(primer),
+    .groups          = "drop"
+  ) %>%
+  arrange(sample_id) %>%
+  tidyr::separate(lineage, into=tl, sep=";" , remove=FALSE) %>%
+  # remove samples that don't have both primers
+  inner_join(select(samples_both_prim, sample_id))
+
+## ---- assign global N→S sample numbers (1 = northernmost) -------------------
+## Numbers are consistent across all habitats so that y-axis positions in
+## faceted bar plots share the same scale, creating natural gaps where a
+## habitat has no sample at a given latitude rank.
+ns_sample_nums <- dat_all_filt_combine_prim %>%
+  distinct(sample_id, lat) %>%
+  arrange(desc(lat)) %>%
+  mutate(sample_num_ns = row_number()) %>%
+  select(sample_id, sample_num_ns)
+
+dat_all_filt_combine_prim <- dat_all_filt_combine_prim %>%
+  left_join(ns_sample_nums, by = "sample_id")
+
+
+```
+
+## Primer combine audit
+Checks that the primer combination in `dat_all_filt_combine_prim` is working
+correctly. Key concern: residual cluster numbers in `lineage` (from the decon
+pipeline) would make the same taxon look different across primers and prevent
+collapsing. Run this after every change to the `tiding` chunk.
+
+```{r primer_combine_audit}
+## ── 1. Residual cluster-number check ─────────────────────────────────────────
+## Any lineage ending in ;digits means the strip regex didn't fire.
+## This MUST be zero — if not, fix the lineage strip in tiding first.
+n_cluster_suffix <- dat_all_filt %>%
+  distinct(lineage) %>%
+  filter(grepl(";-?\\d+$", lineage)) %>%
+  nrow()
+cat(sprintf("Lineages with residual cluster suffix (must be 0): %d\n\n",
+            n_cluster_suffix))
+
+## ── 2. Unique taxa per primer (before combining) ──────────────────────────────
+taxa_per_primer <- dat_all_filt %>%
+  filter(type == "sample") %>%
+  group_by(primer) %>%
+  summarise(n_taxa = n_distinct(lineage), n_samples = n_distinct(sample_id),
+            .groups = "drop")
+cat("Taxa and samples per primer (before combining):\n")
+print(taxa_per_primer)
+cat("\n")
+
+## ── 3. Primer overlap — shared vs unique taxa ─────────────────────────────────
+taxa_18sv9  <- dat_all_filt %>% filter(primer == "18S_V9", type == "sample") %>%
+  distinct(lineage) %>% pull(lineage)
+taxa_18sv7  <- dat_all_filt %>% filter(primer == "18S_V7", type == "sample") %>%
+  distinct(lineage) %>% pull(lineage)
+
+n_shared    <- length(intersect(taxa_18sv9, taxa_18sv7))
+n_only_v9   <- length(setdiff(taxa_18sv9,  taxa_18sv7))
+n_only_v7   <- length(setdiff(taxa_18sv7,  taxa_18sv9))
+n_combined  <- length(union(taxa_18sv9,    taxa_18sv7))
+
+cat(sprintf(
+  "Taxon overlap across primers:\n  Shared (both primers):   %d\n  18S_V9 only:             %d\n  18S_V7 only:             %d\n  Union (all unique taxa): %d\n\n",
+  n_shared, n_only_v9, n_only_v7, n_combined
+))
+
+## ── 4. After combining: count_of_primers distribution ────────────────────────
+## count_of_primers == 2 → taxon detected by both; == 1 → one primer only.
+## After inner_join(samples_both_prim), all samples have both primers, but
+## individual taxa within a sample may still come from one primer only.
+cat("count_of_primers distribution in dat_all_filt_combine_prim:\n")
+print(table(dat_all_filt_combine_prim$count_of_primers))
+cat("\n")
+
+## ── 5. Total unique taxa after combining ─────────────────────────────────────
+n_taxa_combined <- n_distinct(dat_all_filt_combine_prim$lineage)
+n_samples_final <- n_distinct(dat_all_filt_combine_prim$sample_id)
+cat(sprintf("Final combined dataset: %d unique taxa across %d samples\n\n",
+            n_taxa_combined, n_samples_final))
+
+## ── 6. Samples lost at each filtering stage ──────────────────────────────────
+n_before_readfilt <- dat_all_filt %>%
+  filter(type == "sample", !grepl("rep", sample_id)) %>%
+  distinct(primer, sample_id) %>%
+  group_by(sample_id) %>%
+  summarise(n_prim = n(), .groups = "drop") %>%
+  nrow()
+
+n_both_primers <- nrow(samples_both_prim)
+n_final        <- n_distinct(dat_all_filt_combine_prim$sample_id)
+
+cat(sprintf(
+  "Sample retention:\n  After read filter:           %d\n  With both primers present:   %d\n  Final (after combine):       %d\n  Dropped (one primer only):   %d\n\n",
+  n_before_readfilt, n_both_primers, n_final,
+  n_before_readfilt - n_both_primers
+))
+
+## ── 7. Taxa in combined set vs union of per-primer sets ──────────────────────
+## If lineage strip worked, combined taxa should be ≤ union (some taxa lost
+## because they only occur in samples that failed the both-primers filter).
+## Combined taxa should NEVER exceed the union — flag if so.
+if (n_taxa_combined > n_combined) {
+  warning(sprintf(
+    "PROBLEM: combined has MORE unique taxa (%d) than the union of per-primer sets (%d).\nThis suggests lineage strings still differ between primers — check cluster suffix strip.",
+    n_taxa_combined, n_combined
+  ))
+} else {
+  cat(sprintf(
+    "Lineage consistency check OK: combined taxa (%d) ≤ per-primer union (%d)\n",
+    n_taxa_combined, n_combined
+  ))
+}
+
+## ── 8. Top taxa detected by only one primer ───────────────────────────────────
+## High-abundance single-primer taxa may warrant investigation.
+cat("\nTop 10 taxa unique to 18S_V9 (by mean percent_reads):\n")
+dat_all_filt %>%
+  filter(primer == "18S_V9", type == "sample",
+         lineage %in% setdiff(taxa_18sv9, taxa_18sv7)) %>%
+  group_by(lineage) %>%
+  summarise(mean_pct = mean(percent_reads, na.rm = TRUE), .groups = "drop") %>%
+  slice_max(mean_pct, n = 10) %>%
+  tidyr::separate(lineage, into = tl, sep = ";", remove = FALSE) %>%
+  select(Order, Family, Genus, Species, mean_pct) %>%
+  print()
+
+cat("\nTop 10 taxa unique to 18S_V7 (by mean percent_reads):\n")
+dat_all_filt %>%
+  filter(primer == "18S_V7", type == "sample",
+         lineage %in% setdiff(taxa_18sv7, taxa_18sv9)) %>%
+  group_by(lineage) %>%
+  summarise(mean_pct = mean(percent_reads, na.rm = TRUE), .groups = "drop") %>%
+  slice_max(mean_pct, n = 10) %>%
+  tidyr::separate(lineage, into = tl, sep = ";", remove = FALSE) %>%
+  select(Order, Family, Genus, Species, mean_pct) %>%
+  print()
+```
+
+## compare mean vs max primer combine
+Decision made: use MEAN. Kept for reference only — not run.
+
+```{r compare_primers, eval=FALSE, include=FALSE}
+
+
+# 1. Extract ORDER from taxonomy string
+dat_orders <- dat_all_filt_combine_prim %>%
+
+  filter(!is.na(Order))
+
+# 2. Summarize across all samples
+# NOTE: percent_read_max no longer exists — pipeline was fixed to use MEAN.
+# Both columns now show the same values; chunk kept for reference only.
+dat_orders_sum <- dat_orders %>%
+  group_by(Order) %>%
+  summarise(
+    mean_abund = mean(percent_reads, na.rm = TRUE),
+    max_abund  = mean(percent_reads, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# 3. Get top 20 orders (based on mean version)
+top_orders <- dat_orders_sum %>%
+  arrange(desc(mean_abund)) %>%
+  slice(1:20) %>%
+  pull(Order)
+
+# 4. Keep only top 20 and reshape for plotting
+dat_plot <- dat_orders_sum %>%
+  filter(Order %in% top_orders) %>%
+  pivot_longer(cols = c(mean_abund, max_abund),
+               names_to = "method",
+               values_to = "abundance") %>%
+  mutate(method = dplyr::recode(method,
+                         mean_abund = "Mean",
+                         max_abund  = "Max"))
+
+# 5. Plot
+ggplot(dat_plot, aes(x = abundance,
+                     y = fct_reorder(Order, abundance),
+                     fill = method)) +
+  geom_col(position = "dodge") +
+  labs(x = "Relative read proportion",
+       y = "Order",
+       fill = "Combination method",
+       title = "Top 20 Orders: Mean vs Max Across Primers") +
+  theme_bw() +
+  theme(text = element_text(size = 12))
+```
+
+## Sample drop audit
+Cross-checks every sample in the metadata against each filtering stage so you can see exactly where samples were lost and why.
+Produces `drop_audit_df` (one row per sample) and `drop_audit_summary` (counts by habitat × drop stage).
+
+```{r sample_drop_audit}
+
+# ── Ground truth: all intended samples from metadata ─────────────────────────
+# Excludes rep entries (kept separately in the metadata sheet but not analysed).
+sam_meta <- readxl::read_excel(sam_file_path, sheet = "sample_data") %>%
+  dplyr::rename(sample_id = sample_ID) %>%
+  filter(!grepl("rep", sample_id, ignore.case = TRUE)) %>%
+  select(sample_id, HABITAT, AREA, YEAR, SEASON) %>%
+  dplyr::rename(habitat_meta = HABITAT, area_meta = AREA,
+                year_meta = YEAR, season_meta = SEASON)
+
+# ── Stage flags ───────────────────────────────────────────────────────────────
+
+# Stage 1: sample_id appears anywhere in the raw sequence CSV
+in_dat <- dat %>%
+  filter(type == "sample", !grepl("rep", sample_id, ignore.case = TRUE)) %>%
+  distinct(sample_id) %>%
+  mutate(in_dat = TRUE)
+
+# Stage 2: at least one row survives minboot==70 + 18S primer filter
+in_18s_minboot <- dat %>%
+  filter(type == "sample",
+         !grepl("rep", sample_id, ignore.case = TRUE),
+         minboot == 70,
+         grepl("18S|18smini|euka", primer, ignore.case = TRUE)) %>%
+  distinct(sample_id) %>%
+  mutate(in_18s_minboot = TRUE)
+
+# Stage 3: per-sample x primer read sums — determines which primer(s) survive
+#          the low-reads threshold (50% of Q1 across samples)
+reads_check <- dat_all %>%
+  filter(type == "sample",
+         !grepl("rep", sample_id, ignore.case = TRUE),
+         grepl("18S", primer)) %>%
+  distinct(sample_id, primer, primer_taxassign_id, sample_sum_after_filt) %>%
+  left_join(min_reads_min, by = "primer_taxassign_id") %>%
+  mutate(passes_reads = sample_sum_after_filt > fiftypercent_lower)
+
+# Summarise: for each sample, how many primers pass?
+reads_summary <- reads_check %>%
+  group_by(sample_id) %>%
+  summarise(
+    n_primers_sequenced = n(),
+    n_primers_pass      = sum(passes_reads),
+    primers_fail        = paste(primer[!passes_reads],
+                                paste0("(", round(sample_sum_after_filt[!passes_reads]), " reads)"),
+                                collapse = "; "),
+    .groups = "drop"
+  ) %>%
+  mutate(primers_fail = if_else(primers_fail == "", "—", primers_fail))
+
+# Stage 4: sample has both primers after read filter (samples_both_prim)
+in_both_prim <- samples_both_prim %>%
+  mutate(in_both_prim = TRUE)
+
+# ── Build audit table ─────────────────────────────────────────────────────────
+drop_audit_df <- sam_meta %>%
+  left_join(in_dat,          by = "sample_id") %>%
+  left_join(in_18s_minboot,  by = "sample_id") %>%
+  left_join(reads_summary,   by = "sample_id") %>%
+  left_join(in_both_prim,    by = "sample_id") %>%
+  mutate(
+    in_final   = sample_id %in% dat_all_filt_combine_prim$sample_id,
+    drop_stage = case_when(
+      in_final                                                          ~ "retained",
+      is.na(in_dat)                                                     ~ "not_in_sequence_data",
+      is.na(in_18s_minboot)                                             ~ "no_18S_reads_at_minboot70",
+      !is.na(n_primers_pass) & n_primers_pass == 0                      ~ "low_reads_both_primers",
+      !is.na(n_primers_pass) & n_primers_pass < n_primers_sequenced     ~ "low_reads_one_primer",
+      is.na(in_both_prim)                                               ~ "only_one_primer_sequenced",
+      TRUE                                                              ~ "unknown"
+    )
+  )
+
+# ── Summary table: counts by habitat x drop stage ────────────────────────────
+drop_audit_summary <- drop_audit_df %>%
+  group_by(habitat_meta, drop_stage) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  tidyr::pivot_wider(names_from = drop_stage, values_from = n, values_fill = 0) %>%
+  select(habitat_meta,
+         any_of(c("retained",
+                  "not_in_sequence_data",
+                  "no_18S_reads_at_minboot70",
+                  "low_reads_both_primers",
+                  "low_reads_one_primer",
+                  "only_one_primer_sequenced",
+                  "unknown"))) %>%
+  mutate(total_in_metadata = rowSums(across(where(is.numeric))),
+         pct_retained = round(retained / total_in_metadata * 100, 1))
+
+print(drop_audit_summary)
+
+# ── Per-sample detail for dropped samples ─────────────────────────────────────
+drop_audit_dropped <- drop_audit_df %>%
+  filter(drop_stage != "retained") %>%
+  select(sample_id, habitat_meta, area_meta, year_meta,
+         drop_stage, primers_fail) %>%
+  arrange(habitat_meta, drop_stage, sample_id)
+
+print(drop_audit_dropped)
+
+```
+
+## spread
+For multiglm analysis - not necessary
+```{r spread, eval=FALSE, include=FALSE}
+
+########################################################################
+# for "18S_V7",
+## sv table needs to be lineage in rows, then sample_id as column names    names(dat2)
+sv<- dat_all_filt %>%   # names(sv)      head(dat2$lineage)  dat2$lineage[1:100]
+   #
+  filter(primer_name=="18S_V7") %>% 
+  #
+  select(lineage, reads, sample_id_meta) %>% 
+  pivot_wider(names_from=sample_id_meta, values_from=reads, values_fill=0) %>%
+  tidyr::separate(lineage, into=tl, sep=";" , remove=TRUE) %>% 
+  mutate_if(is.character, list(~na_if(., "NA"))) %>% # convert NA to tru NA
+  mutate(Superkingdom="Eukaryota")   # 
+
+sv<-data.frame(sv) # coerce to data.frame for downstream indexing
+
+  ####  make sure all taxa and samples have info sv[1:5,1:20]
+  c_start_sample<-length(tl)+1  # first column of sample data  
+tr<-c(c_start_sample:length(names(sv)))  # sample data columns    names(sv)
+dr<-c(1:(c_start_sample-1))  # lineage columna
+mes_x<-sv[which(rowSums(sv[,tr])>0),]  # remove taxa (rows) with no reads
+mes_t<-mes_x[,tr]
+mes_d<-mes_x[,dr]
+x2<-mes_t[,which(colSums(mes_t)>0)]  # remove samples (columns) with no reads
+sv2_18S_V7<-cbind(mes_d,x2)
+
+########################################################################
+# for  "18S_V9"
+## sv table needs to be lineage in rows, then sample_id as column names    names(dat2)
+sv<- dat_all_filt %>%   # names(sv)      head(dat2$lineage)  dat2$lineage[1:100]
+   #
+  filter(primer_name=="18S_V9") %>% 
+  #
+  select(lineage, reads, sample_id_meta) %>% 
+  pivot_wider(names_from=sample_id_meta, values_from=reads, values_fill=0) %>%
+  tidyr::separate(lineage, into=tl, sep=";" , remove=TRUE) %>% 
+  mutate_if(is.character, list(~na_if(., "NA"))) %>% # convert NA to tru NA
+  mutate(Superkingdom="Eukaryota")   # 
+
+sv<-data.frame(sv) # coerce to data.frame for downstream indexing
+
+  ####  make sure all taxa and samples have info sv[1:5,1:20]
+  c_start_sample<-length(tl)+1  # first column of sample data  
+tr<-c(c_start_sample:length(names(sv)))  # sample data columns    names(sv)
+dr<-c(1:(c_start_sample-1))  # lineage columna
+mes_x<-sv[which(rowSums(sv[,tr])>0),]  # remove taxa (rows) with no reads
+mes_t<-mes_x[,tr]
+mes_d<-mes_x[,dr]
+x2<-mes_t[,which(colSums(mes_t)>0)]  # remove samples (columns) with no reads
+sv2_18S_V9<-cbind(mes_d,x2)
+
+########################################################################
+# for  combined
+## sv table needs to be lineage in rows, then sample_id as column names    names(dat2)
+sv<- dat_all_filt_combine_prim %>%   # names(sv)      head(dat2$lineage)  dat2$lineage[1:100]
+
+  select(lineage, percent_reads, sample_id_meta) %>%
+  pivot_wider(names_from=sample_id_meta, values_from=percent_reads, values_fill=0) %>%
+  tidyr::separate(lineage, into=tl, sep=";" , remove=TRUE) %>% 
+  mutate_if(is.character, list(~na_if(., "NA"))) %>% # convert NA to tru NA
+  mutate(Superkingdom="Eukaryota")   # 
+
+sv<-data.frame(sv) # coerce to data.frame for downstream indexing
+
+  ####  make sure all taxa and samples have info sv[1:5,1:20]
+  c_start_sample<-length(tl)+1  # first column of sample data  
+tr<-c(c_start_sample:length(names(sv)))  # sample data columns    names(sv)
+dr<-c(1:(c_start_sample-1))  # lineage columna
+mes_x<-sv[which(rowSums(sv[,tr])>0),]  # remove taxa (rows) with no reads
+mes_t<-mes_x[,tr]
+mes_d<-mes_x[,dr]
+x2<-mes_t[,which(colSums(mes_t)>0)]  # remove samples (columns) with no reads
+sv2_combined<-cbind(mes_d,x2)
+
+
+
+###################################################################################################
+###  make sample data
+## only ran before not now
+  #    names(mes1)  names(sv2)  8 to 315  setdiff(names(sv) , names(sv2))
+## sample data for making trees - sample_id colun first, must match column names in sv table
+#tr<-c(c_start_sample:length(names(sv2))) 
+
+sample <- dat_all_filt %>%    #names(dat2)
+   select(primer_taxassign_id:type,reads_per_sample_dada:log_percent_reads,sample_id_meta) %>%
+  filter(!duplicated(sample_id_meta))  %>% 
+   # filter(sample_id_meta %in% names(sv2[,tr])) %>%  # match up with previous
+  ## final filter, can't have NA's for comparisons
+    filter(type=="sample") %>% 
+   # remove reps
+  filter(!grepl("rep", sample_id)) %>% 
+    filter(complete.cases(habitat))
+
+#  levels(sample$primer_name)
+## find seagrass samples with same lat
+mes<-sample %>% 
+  filter(habitat=="Seagrass" ) %>% 
+  filter(!grepl("euk", sample_id_u)) %>% 
+  select(sample_id_u, sample_num, lat, lon) %>% 
+  arrange(lat)
+  
+
+
+```
+
+## export spread version
+do not need  - SET not to run!!
+
+```{r export, eval=FALSE, include=FALSE}
+
+#data.table::fwrite(???,paste(dir,export_file,"Red_sea_eDNA_trairts1.csv",sep=""),row.names=FALSE, sep=",")
+
+data.table::fwrite(dat_all_filt,         paste0(dir, "Red_sea_eDNA_taxa_long_both_primers.csv"),    sep = ",")
+data.table::fwrite(dat_all_filt_combine_prim, paste0(dir, "Red_sea_eDNA_taxa_long_primer_combined.csv"), sep = ",")
+data.table::fwrite(sample,               paste0(dir, "Red_sea_eDNA_taxa_sample_all.csv"),             sep = ",")
+
+#data.table::fwrite(sv2_18S_V7,    paste0(dir, "Red_sea_eDNA_taxa_spread_sv2_18S_V7.csv"),    sep = ",")
+#data.table::fwrite(sv2_18S_V9,    paste0(dir, "Red_sea_eDNA_taxa_spread_sv2_18S_V9.csv"),    sep = ",")
+#data.table::fwrite(sv2_combined,  paste0(dir, "Red_sea_eDNA_taxa_spread_both_primers.csv"),  sep = ",")
+```
+
+
+
+
+## Eukaryote by phylum
+
+```{r euk_phylum}
+#   use dat_all_filt
+#  pool to phylum  !!!!!   get only needed data - keys, phylums, reads
+euk_phylum<- dat_all_filt %>%  #  names(dat_all_filt)
+  # break out lineage
+  tidyr::separate(lineage, into=tl, sep=";" , remove=FALSE)   %>% 
+  #
+  select(habitat, primer, primer_taxassign_id, sample_id_u, year,season,area,lat,lon,depth ,Phylum, reads, rare_reads, percent_reads ) %>% 
+  #  pool reads at phylum
+  group_by(habitat, primer, primer_taxassign_id, sample_id_u, year,season,area,lat,lon,depth ,Phylum,) %>% 
+  summarise(reads_new=sum(reads), rare_reads_new=sum(rare_reads), percent_reads= sum(percent_reads), rich_reads= length(reads[reads>0]), rich_rare_reads= length(reads[rare_reads>0]), n=n() ) %>% ## cannot use reads again or will mess up calcs - need new_
+  filter(Phylum !="NA") %>% 
+  ungroup() %>% 
+  rename(reads=reads_new, rare_reads = rare_reads_new) %>% 
+  droplevels()
+
+## rank phylum by %
+euk_phylum_rank <- euk_phylum %>%
+  group_by(Phylum) %>%
+  summarise(max_reads = max(percent_reads),mean = mean(percent_reads), median=median(percent_reads), n = n()) %>%
+  arrange(desc(median)) %>%
+  filter( n > 10) %>% # filter phyla to only include those with this many samples
+  pull(Phylum)
+
+##  determine how many phyla to include
+n<-15
+euk_phylum_rank<-euk_phylum_rank[1:n]
+
+## order by previous
+euk_phylum_top <- euk_phylum %>%
+  filter(Phylum %in% euk_phylum_rank) %>%
+  mutate(Phylum = factor(Phylum, levels = euk_phylum_rank)) %>%
+  arrange(Phylum) %>% 
+   ungroup() 
+  #mutate(ybp=as.integer(ybp))  # made some slices taht same !
+
+
+
+#########################################################
+#########################################################
+#     pool primers   !!!!!
+#########################################################
+
+euk_phylum_combine_prim <- euk_phylum %>%   # names(euk_phylum)  names(euk_phylum_combine_prim)
+  #  select
+  separate(sample_id_u, c("primer", "sample_id", "minboot"), sep = ";") %>%
+  select(-primer, -minboot) %>%
+  group_by(sample_id,habitat, year,  season,area, lat,lon,depth, Phylum) %>% 
+  summarize(percent_reads=mean(percent_reads), count_of_primers=n()  ) %>% 
+  arrange(sample_id)
+
+## rank phylum by %
+euk_phylum_rank_combine_prim <- euk_phylum_combine_prim %>%
+  group_by(Phylum) %>%
+  summarise(max_reads = max(percent_reads),mean = mean(percent_reads), median=median(percent_reads), n = n()) %>%
+  arrange(desc(median)) %>%
+  filter( n > 10) %>% # filter phyla to only include those with this many samples
+  pull(Phylum)
+
+##  determine how many phyla to include
+n<-15
+euk_phylum_rank_combine_prim<-euk_phylum_rank_combine_prim[1:n]
+
+## order by previous — use the combine-primer rank (not the per-primer rank)
+euk_phylum_top_combine_prim <- euk_phylum_combine_prim %>%
+  filter(Phylum %in% euk_phylum_rank_combine_prim) %>%
+  mutate(Phylum = factor(Phylum, levels = euk_phylum_rank_combine_prim)) %>%
+  arrange(Phylum) %>%
+   ungroup()
+
+```
+
+
+
+## Eukaryote by order
+
+```{r euk_order}
+#   use dat_all_filt
+#  pool to order  !!!!!   get only needed data - keys, orders, reads
+euk_order<- dat_all_filt %>%  #  names(dat_all_filt)
+  # break out lineage
+  tidyr::separate(lineage, into=tl, sep=";" , remove=FALSE)   %>% 
+  #
+  select(habitat, primer, primer_taxassign_id, sample_id_u, year,season,area,lat,lon,depth ,Phylum:Order, reads, rare_reads, percent_reads ) %>% 
+  #  pool reads at order
+  group_by(habitat, primer, primer_taxassign_id, sample_id_u, year,season,area,lat,lon,depth ,Phylum,Class, Order) %>% 
+  summarise(reads_new=sum(reads), rare_reads_new=sum(rare_reads), percent_reads= sum(percent_reads), rich_reads= length(reads[reads>0]), rich_rare_reads= length(reads[rare_reads>0]), n=n() ) %>% ## cannot use reads again or will mess up calcs - need new_
+  filter(Order !="NA") %>% 
+  ungroup() %>% 
+  rename(reads=reads_new, rare_reads = rare_reads_new) %>% 
+  droplevels()
+
+## rank g by %
+euk_order_rank <- euk_order %>%
+  group_by(Phylum,Class, Order) %>%
+  summarise(max_reads = max(percent_reads),mean = mean(percent_reads), median=median(percent_reads), n = n()) %>%
+  arrange(desc(median)) %>%
+  filter( n > 10) %>% # filter g to only include those with this many samples
+  pull(Order)
+
+##  determine how many gto include
+n<-15
+euk_order_rank<-euk_order_rank[1:n]
+
+## order by previous
+euk_order_top <- euk_order %>%
+  filter(Order %in% euk_order_rank) %>%
+  mutate(Order = factor(Order, levels = euk_order_rank)) %>%
+  arrange(Order) %>% 
+   ungroup() 
+  #mutate(ybp=as.integer(ybp))  # made some slices taht same !
+
+#########################################################
+#########################################################
+#     pool primers   !!!!!
+#########################################################
+
+euk_order_combine_prim <- euk_order %>%   # names(euk_order)  names(euk_order_combine_prim)
+  #  select
+  separate(sample_id_u, c("primer", "sample_id", "minboot"), sep = ";") %>%
+  select(-primer, -minboot) %>%
+  group_by(sample_id,habitat, year,  season,area, lat,lon,depth, Phylum,Class, Order) %>% 
+  summarize(percent_reads=mean(percent_reads), count_of_primers=n()  ) %>% 
+  arrange(sample_id)
+
+## rank order by %
+euk_order_rank_combine_prim <- euk_order_combine_prim %>%
+  group_by(Phylum,Class, Order) %>%
+  summarise(max_reads = max(percent_reads),mean = mean(percent_reads), median=median(percent_reads), n = n()) %>%
+  arrange(desc(median)) %>%
+  filter( n > 10) %>% # filter phyla to only include those with this many samples
+  pull(Order)
+
+##  determine how many phyla to include
+n<-15
+euk_order_rank_combine_prim <-euk_order_rank_combine_prim[1:n]
+
+## order by previous — use the combine-primer rank (not the per-primer rank)
+euk_order_top_combine_prim <- euk_order_combine_prim %>%
+  filter(Order %in% euk_order_rank_combine_prim) %>%
+  mutate(Order = factor(Order, levels = euk_order_rank_combine_prim)) %>%
+  arrange(Order) %>%
+   ungroup()
+
+```
+
+
+
+
+## Eukaryote by genus
+
+```{r euk_genus}
+#   use dat_all_filt
+#  pool to genus  !!!!!   get only needed data - keys, genera, reads
+euk_genus<- dat_all_filt %>%  #  names(dat_all_filt)
+  # break out lineage
+  tidyr::separate(lineage, into=tl, sep=";" , remove=FALSE)   %>% 
+  #
+  select(habitat, primer, primer_taxassign_id, sample_id_u, year,season,area,lat,lon,depth ,Phylum:Genus, reads, rare_reads, percent_reads ) %>% 
+  #  pool reads at genus
+  group_by(habitat, primer, primer_taxassign_id, sample_id_u, year,season,area,lat,lon,depth ,Phylum,Class, Order,Family,Genus) %>% 
+  summarise(reads_new=sum(reads), rare_reads_new=sum(rare_reads), percent_reads= sum(percent_reads), rich_reads= length(reads[reads>0]), rich_rare_reads= length(reads[rare_reads>0]), n=n() ) %>% ## cannot use reads again or will mess up calcs - need new_
+  filter(Genus !="NA") %>% 
+  ungroup() %>% 
+  rename(reads=reads_new, rare_reads = rare_reads_new) %>% 
+  droplevels()
+
+## rank g by %
+euk_genus_rank <- euk_genus %>%
+  group_by(Genus) %>%
+  summarise(max_reads = max(percent_reads),mean = mean(percent_reads), median=median(percent_reads), n = n()) %>%
+  arrange(desc(median)) %>%
+  filter( n > 10) %>% # filter g to only include those with this many samples
+  pull(Genus)
+
+##  determine how many gto include
+n<-15
+euk_genus_rank<-euk_genus_rank[1:n]
+
+## order by previous
+euk_genus_top <- euk_genus %>%
+  filter(Genus %in% euk_genus_rank) %>%
+  mutate(Genus = factor(Genus, levels = euk_genus_rank)) %>%
+  arrange(Genus) %>% 
+   ungroup() 
+  #mutate(ybp=as.integer(ybp))  # made some slices taht same !
+
+#########################################################
+#########################################################
+#     pool primers   !!!!!
+#########################################################
+
+euk_genus_combine_prim <- euk_genus %>%   # names(euk_genus)  names(euk_genus_combine_prim)
+  #  select
+  separate(sample_id_u, c("primer", "sample_id", "minboot"), sep = ";") %>%
+  select(-primer, -minboot) %>%
+  group_by(sample_id,habitat, year,  season,area, lat,lon,depth, Phylum,Class, Order,Family,Genus) %>% 
+  summarize(percent_reads=mean(percent_reads), count_of_primers=n()  ) %>% 
+  arrange(sample_id)
+
+## rank genus by %
+euk_genus_rank_combine_prim <- euk_genus_combine_prim %>%
+  group_by(Genus) %>%
+  summarise(max_reads = max(percent_reads),mean = mean(percent_reads), median=median(percent_reads), n = n()) %>%
+  arrange(desc(median)) %>%
+  filter( n > 10) %>% # filter phyla to only include those with this many samples
+  pull(Genus)
+
+##  determine how many phyla to include
+n<-15
+euk_genus_rank_combine_prim <-euk_genus_rank_combine_prim[1:n]
+
+## order by previous — use the combine-primer rank (not the per-primer rank)
+euk_genus_top_combine_prim <- euk_genus_combine_prim %>%
+  filter(Genus %in% euk_genus_rank_combine_prim) %>%
+  mutate(Genus = factor(Genus, levels = euk_genus_rank_combine_prim)) %>%
+  arrange(Genus) %>%
+   ungroup()
+
+```
+
+
+
+## Metazoan by order
+
+```{r animal}
+#   use dat_all_filt
+# limit to metaz and recalc percent, get richness and diversity
+#  pool to order  !!!!!   get only needed data - keys, phylums, reads
+
+
+
+## make pattern for filtering
+metaz_pat<-c("Annelida","Arthropoda","Chordata","Cnidaria","Ctenophora","Echinodermata","Gastrotricha","Mollusca","Nematoda","Orthonectida","Platyhelminthes","Porifera","Rotifera","Sipuncula","Tardigrada","Urochordata","Chaetognatha","Craniata","Nemertea","Bryozoa","Hemichordata","Brachiopoda","Entoprocta","Cephalochordata","Entoprocta","Gnathostomulida", "Xenacoelomorpha") 
+metaz_pat<-paste(metaz_pat, collapse = "|")
+
+
+
+# limit to metazoan phyla then get reads per sample and % per taxa
+metaz_order <- euk_order %>%   # names(euk_genus)  unique(dat3$habitat)
+  filter(grepl(metaz_pat, Phylum))  %>%  # limit to metaz phyla
+    filter(Order !="NA") %>% 
+  select(-rare_reads,-percent_reads, -rich_reads, -rich_rare_reads, -n) %>% 
+  #unite("lineage", Phylum:Order, sep = ";", remove = FALSE) %>% 
+  #group_by(primer, core, ybp) %>% 
+    #  pool reads at genus
+  group_by( primer, primer_taxassign_id,sample_id_u,lat,lon,depth) %>% 
+  mutate(sum_metaz_reads = sum(reads)) %>% 
+  ungroup() %>% 
+  mutate(percent_reads = (reads / sum_metaz_reads)  * 100) %>% 
+  #  !!!!!!  remove if sample has less than 100 metazoan reads  !!!
+  filter(sum_metaz_reads >= 100) %>% 
+  #rename(reads=reads_new, rare_reads = rare_reads_new) %>% 
+  droplevels()
+
+## rank g by %
+metaz_order_rank <- metaz_order %>%
+  group_by(Phylum,Class, Order) %>%
+  summarise(max_reads = max(percent_reads),mean = mean(percent_reads), median=median(percent_reads), n = n()) %>%
+  arrange(desc(median)) %>%
+  filter( n > 3) %>% # filter g to only include those with this many samples
+  pull(Order)
+
+##  determine how many to include
+n<-15
+metaz_order_rank<-metaz_order_rank[1:n]
+
+## order an dlimit by previous
+metaz_order_top <- metaz_order %>%
+  filter(Order %in% metaz_order_rank) %>%
+  mutate(Order = factor(Order, levels = metaz_order_rank)) %>%
+  arrange(Order) %>% 
+   ungroup() 
+  #mutate(ybp=as.integer(ybp))  # made some slices taht same !
+
+#########################################################
+#########################################################
+#   for  pooled primers   !!!!!
+#########################################################
+# use combined primers - removed samples that had only 1 primer
+
+# sum by selected lineage
+metaz_order_combine_prim <- euk_order_combine_prim %>%   # names(metaz_phylum)  names(metaz_phylum_combine_prim)
+  # limit to metazoan phylums
+    filter(grepl(metaz_pat, Phylum))  %>%  # limit to metaz phyla
+    filter(Order !="NA") %>% 
+  ungroup() %>% 
+  #  select
+  group_by(sample_id, lat,lon,depth) %>% 
+  
+    mutate(sum_metaz_reads = sum(percent_reads)) %>% 
+  ungroup() %>% 
+  mutate(percent_reads2 = (percent_reads/ sum_metaz_reads)  * 100 , count_of_primers=n() ) %>% 
+  #  !!!!!!  remove if sample has less than 100 metazoan reads  !!!
+  filter(sum_metaz_reads >= 1) %>% 
+  select(-percent_reads, -count_of_primers)  %>% 
+  rename(percent_reads = percent_reads2) %>% 
+  droplevels() %>% 
+  arrange(sample_id)
+
+## rank phylum by %
+metaz_order_rank_combine_prim <- metaz_order_combine_prim %>%
+  group_by(Phylum, Class, Order) %>%
+  summarise(max_reads = max(percent_reads),mean = mean(percent_reads), median=median(percent_reads), n = n()) %>%
+  arrange(desc(median)) %>%
+  filter( n > 3) %>% # filter order to only include those with this many samples
+  pull(Order)
+
+##  determine how many phyla to include
+n<-15
+metaz_order_rank_combine_prim<-metaz_order_rank_combine_prim[1:n]
+
+## order by previous — use the combine-primer rank      unique(metaz_order_top_combine_prim$Order)
+metaz_order_top_combine_prim <- metaz_order_combine_prim %>%
+  filter(Order %in% metaz_order_rank_combine_prim) %>%
+  mutate(Order = factor(Order, levels = metaz_order_rank_combine_prim)) %>%
+  arrange(Order) %>%
+   ungroup()
+
+
+  
+```
+
+## Fig 1 — Sampling map
+Composite figure: full Red Sea overview (left) + 4 zoomed area panels (right).
+Original 7 boxes (a–g) merged into 4 geographic groups:
+  a  = old a + b  (northern Red Sea, Duba/Qasabah area)
+  b  = old c      (Al Wajh / Farasan Bank)
+  c  = old d + e  (Yanbu / Thuwal)
+  d  = old f + g  (Al Lith / Farasan south)
+Box extents expanded relative to originals to include previously clipped samples:
+  a: xmax extended to 36.15 (captures DC 2016/2017 M1 mangroves at lon 36.011)
+  b: ymin lowered to 25.05 (captures CCF_S 2017 AW SG at lat 25.157)
+  d: xmax extended to 41.70 (captures DC 2017 S6/S7/S8/S9/M4 up to lon 41.57)
+     ymax raised to 20.25 (captures DC 2016 S6 at lat 20.160)
+Panels a–b stacked in middle column; c–d stacked in right column.
+All zoom panels have solid black borders.
+```{r sampling_map}
+## patchwork is loaded in the libraries chunk
+
+## ensure plots subfolder exists
+dir.create(paste0(dir, plot_file), showWarnings = FALSE, recursive = TRUE)
+
+## ---- sample locations -------------------------------------------------------
+## Fixed seed so jitter offsets are identical across overview and zoom panels,
+## keeping points and their text labels spatially consistent.
+set.seed(42)
+loc_data <- dat_all_filt_combine_prim %>%
+  distinct(sample_id, lat, lon, habitat, sample_num_ns) %>%
+  filter(!is.na(lat), !is.na(lon), !is.na(habitat)) %>%
+  mutate(
+    habitat = factor(habitat, levels = c("Coral", "Mangrove", "Seagrass")),
+    ## small jitter (~0-4 km) separates co-located samples without misrepresenting geography
+    lon_j   = jitter(lon, amount = 0.04),
+    lat_j   = jitter(lat, amount = 0.04)
+  )
+
+## ---- colour scheme ----------------------------------------------------------
+hab_cols <- c(
+  "Coral"    = "#D73027",
+  "Mangrove" = "#1A9A72",
+  "Seagrass" = "#F5A623"
+)
+
+## ---- zoom-region bounding boxes (lon/lat) -----------------------------------
+## 4 groups combining the original 7 boxes.
+## Extents set to fully enclose all retained samples; make_zoom_panel adds
+## a buf=0.10 margin beyond each edge when drawing the panel and filtering points.
+## Panel labels: overview = a; zoom panels = b–e.
+zoom_boxes <- list(
+  # old a + b: northern Red Sea (Qasabah, Duba)
+  # xmax extended to 36.15 to include M1 mangroves at lon 36.011
+  b = c(xmin = 34.75, xmax = 36.15, ymin = 26.75, ymax = 28.15),
+
+  # old c: Al Wajh / Farasan Bank cluster
+  # ymin lowered to 25.05 to include CCF_S 2017 AW SG at lat 25.157
+  c = c(xmin = 36.35, xmax = 37.25, ymin = 25.05, ymax = 26.10),
+
+  # old d + e: Yanbu / Thuwal
+  d = c(xmin = 37.75, xmax = 39.15, ymin = 21.90, ymax = 24.05),
+
+  # old f + g: Al Lith / southern Farasan Banks
+  # xmax extended to 41.70 to include DC 2017 S6/S7/S8/S9/M4 (up to lon 41.57)
+  # ymax raised to 20.25 to include DC 2016 S6 at lat 20.160
+  e = c(xmin = 39.75, xmax = 41.70, ymin = 17.75, ymax = 20.25)
+)
+
+## ---- sf polygons for overview boxes ----------------------------------------
+box_polys <- purrr::imap(zoom_boxes, function(b, nm) {
+  sf::st_sf(
+    label    = nm,
+    geometry = sf::st_sfc(sf::st_polygon(list(matrix(
+      c(b["xmin"], b["ymin"], b["xmax"], b["ymin"],
+        b["xmax"], b["ymax"], b["xmin"], b["ymax"],
+        b["xmin"], b["ymin"]),
+      ncol = 2, byrow = TRUE))), crs = 4326)
+  )
+}) %>% do.call(rbind, .)
+
+label_df <- data.frame(
+  label = names(zoom_boxes),
+  x     = sapply(zoom_boxes, `[[`, "xmax"),
+  y     = sapply(zoom_boxes, `[[`, "ymax")
+)
+
+## ---- overview map -----------------------------------------------------------
+p_overview <- ggplot() +
+  geom_sf(data = me, fill = "grey90", colour = "grey60", linewidth = 0.25) +
+  geom_sf(data = box_polys, fill = NA, colour = "black", linewidth = 0.45) +
+  geom_text(data = label_df, aes(x = x, y = y, label = label),
+            hjust = 0, vjust = -0.25, size = 4.5) +
+  geom_point(data = loc_data,
+             aes(x = lon_j, y = lat_j, colour = habitat), size = 1.6, alpha = 0.65) +
+  scale_colour_manual(values = hab_cols, name = "Habitat") +
+  coord_sf(xlim = c(32, 44), ylim = c(10, 30), expand = FALSE) +
+  labs(x = NULL, y = "Latitude") +
+  theme_bw(base_size = 9) +
+  theme(
+    legend.position      = c(0.19, 0.28),
+    legend.background    = element_rect(fill = "white", colour = "grey80", linewidth = 0.4),
+    legend.key           = element_blank(),
+    legend.title         = element_text(size = 12, face = "bold"),
+    legend.text          = element_text(size = 11),
+    panel.border         = element_rect(fill = NA, colour = "black", linewidth = 0.6),
+    panel.background     = element_rect(fill = "#D6EAF8"),
+    axis.text            = element_text(size = 11),
+    axis.title.y         = element_text(size = 11),
+    ## right margin = 0 pulls the zoom grid flush
+    plot.margin          = margin(5, 0, 5, 5)
+  )
+
+## ---- inset locator map (top-right corner of overview) -----------------------
+## Shows wider Arabian Peninsula region; black rectangle marks the overview extent.
+## Uses world (medium scale) — sufficient detail at this zoom level.
+p_inset <- ggplot() +
+  geom_sf(data = world, fill = "grey85", colour = "grey50", linewidth = 0.15) +
+  annotate("rect",
+           xmin = 34.75, xmax = 41.70, ymin = 17.75, ymax = 28.15,
+           fill = NA, colour = "black", linewidth = 0.9) +
+  coord_sf(xlim = c(20, 65), ylim = c(5, 45), expand = FALSE) +
+  theme_void() +
+  theme(
+    panel.border     = element_rect(fill = NA, colour = "black", linewidth = 0.7),
+    panel.background = element_rect(fill = "#D6EAF8"),
+    plot.background  = element_rect(fill = "white", colour = NA)
+  )
+
+## scale bar + panel label "a" while p_overview is still a plain ggplot.
+## The "a" label MUST be added before inset_element: patchwork's + operator
+## after inset_element attaches layers to the inset plot, not the base map.
+p_overview <- p_overview +
+  ggspatial::annotation_scale(
+    location      = "br",
+    width_hint    = 0.20,
+    unit_category = "metric",
+    style         = "bar",
+    text_cex      = 0.85,
+    pad_x         = unit(0.25, "cm"),
+    pad_y         = unit(0.25, "cm")
+  ) +
+  annotate("text", x = 32.15, y = 29.75, label = "a",
+           hjust = 0, vjust = 1, size = 4.5)
+
+## embed inset — p_overview becomes a patchwork object after this line
+p_overview <- p_overview +
+  inset_element(p_inset,
+                left = 0.60, bottom = 0.72, right = 1.00, top = 1.00,
+                align_to = "panel")
+
+## ---- helper: single zoom panel (with km scale bar) -------------------------
+make_zoom_panel <- function(label, box, loc, basemap, cols, buf = 0.10) {
+  sub_loc <- loc %>%
+    filter(lon >= box["xmin"] - buf, lon <= box["xmax"] + buf,
+           lat >= box["ymin"] - buf, lat <= box["ymax"] + buf)
+  # ~3 evenly-spaced tick labels per axis; pretty() picks clean round values
+  x_breaks <- pretty(c(box["xmin"] - buf, box["xmax"] + buf), n = 3)
+  y_breaks <- pretty(c(box["ymin"] - buf, box["ymax"] + buf), n = 3)
+  ggplot() +
+    geom_sf(data = basemap, fill = "grey90", colour = "grey40", linewidth = 0.30) +
+    geom_point(data = sub_loc,
+               aes(x = lon_j, y = lat_j, colour = habitat), size = 2.6, alpha = 0.70) +
+    ggrepel::geom_text_repel(data = sub_loc,
+               aes(x = lon_j, y = lat_j, label = sample_num_ns),
+               size = 2.5, colour = "black", fontface = "bold",
+               box.padding = 0.25, point.padding = 0.15,
+               min.segment.length = 0.3, max.overlaps = Inf,
+               segment.colour = "grey50", segment.size = 0.3) +
+    scale_colour_manual(values = cols, guide = "none") +
+    scale_x_continuous(breaks = x_breaks) +
+    scale_y_continuous(breaks = y_breaks) +
+    ggspatial::annotation_scale(
+      location      = "br",
+      width_hint    = 0.30,
+      unit_category = "metric",
+      style         = "bar",
+      text_cex      = 0.80,
+      pad_x         = unit(0.15, "cm"),
+      pad_y         = unit(0.15, "cm")
+    ) +
+    coord_sf(xlim = c(box["xmin"] - buf, box["xmax"] + buf),
+             ylim = c(box["ymin"] - buf, box["ymax"] + buf), expand = FALSE) +
+    annotate("text", x = box["xmin"] - buf + 0.07, y = box["ymax"] + buf - 0.07,
+             label = label, hjust = 0, vjust = 1, size = 4.5) +
+    labs(x = NULL, y = NULL) +
+    theme_bw(base_size = 11) +
+    theme(
+      panel.border     = element_rect(colour = "black", fill = NA, linewidth = 1.3),
+      panel.background = element_rect(fill = "#D6EAF8"),
+      axis.text        = element_text(size = 10),
+      axis.ticks       = element_line(linewidth = 0.25),
+      plot.margin      = margin(3, 3, 3, 3)
+    )
+}
+
+## ---- build all 4 panels -----------------------------------------------------
+zoom_panels <- mapply(make_zoom_panel,
+  label    = names(zoom_boxes),
+  box      = zoom_boxes,
+  MoreArgs = list(loc = loc_data, basemap = me, cols = hab_cols),
+  SIMPLIFY = FALSE)
+
+## ---- zoom panel margins and axis labels -------------------------------------
+## Left margin = 0 on the left-column panels (b, d) pulls them flush against
+## the overview. Add Longitude title to bottom-row panels (d, e) only.
+zoom_panels[["b"]] <- zoom_panels[["b"]] + theme(plot.margin = margin(3, 3, 3, 0))
+zoom_panels[["d"]] <- zoom_panels[["d"]] + theme(plot.margin = margin(3, 3, 3, 0))
+
+## ---- compose ----------------------------------------------------------------
+zoom_grid <- (zoom_panels[["b"]] | zoom_panels[["c"]]) /
+             (zoom_panels[["d"]] | zoom_panels[["e"]])
+
+inner <- (p_overview | zoom_grid) + plot_layout(widths = c(2.2, 2.0))
+
+## ---- single x-axis label ----------------------------------------------------
+## wrap_elements strip works for x because the gap is just the bottom plot
+## margin — no tick-label area in the way (unlike the y-axis side).
+## inner is treated as one unit by /, so x_lab spans the full figure width.
+x_lab <- wrap_elements(
+  panel = grid::textGrob("Longitude", gp = grid::gpar(fontsize = 11))
+) + theme(plot.margin = margin(0, 0, 0, 0))
+
+sampling_map <- (inner / x_lab) + plot_layout(heights = c(1, 0.04))
+
+sampling_map
+
+ggsave(paste0(dir, plot_file, "/RS_surface_sampling_map.tiff"),
+       sampling_map, width = 34, height = 22, units = "cm", dpi = 300)
+```
+
+
+
+
+## Figs 2 & 3 — Bar plot helpers
+
+```{r barplot_helpers}
+## ---- Helper: order sample_id factor N→S (north/high-lat at top) ------------
+## Within each call, samples are ranked by mean lat (desc = north is first /
+## plotted at the top of the y-axis in a horizontal bar chart).
+ns_order <- function(df, id_col = "sample_id") {
+  df %>%
+    group_by(!!sym(id_col)) %>%
+    mutate(.lat_mean = mean(lat, na.rm = TRUE)) %>%
+    ungroup() %>%
+    mutate(!!sym(id_col) := forcats::fct_reorder(
+      !!sym(id_col), .lat_mean, .desc = FALSE))
+  # .desc=FALSE → lowest lat (south) gets factor level 1, plotted at bottom;
+  # ggplot y-axis is drawn bottom-to-top, so north ends up at top.
+}
+
+## ---- Shared ggplot theme for bar figures ------------------------------------
+theme_bar <- function(base = 10) {
+  theme_bw(base_size = base) +
+    theme(
+      panel.border     = element_rect(colour = "black", fill = NA, linewidth = 0.8),
+      strip.background = element_rect(fill = "grey90", colour = "black"),
+      strip.text       = element_text(face = "bold"),
+      axis.text.y      = element_text(size = 6),
+      legend.position  = "right",
+      legend.key.size  = unit(0.35, "cm"),
+      legend.text      = element_text(size = 8),
+      plot.caption     = element_text(size = 7, colour = "grey50")
+    )
+}
+
+## ---- Colour palettes (15 distinct colours each) -----------------------------
+## Phylum palette — ordered to match euk_phylum_rank_combine_prim
+phylum_pal <- c(
+"#7f265b","#5dbb68","#58388b","#9eb13f","#677fd8","#ca913b","#bc80d5","#45bc8d","#c9417e","#36dee6","#ba4758","#758a3c","#c25bac","#b75636","#da75a0"
+)
+
+
+phylum_fill <- setNames(
+  phylum_pal[seq_along(euk_phylum_rank_combine_prim)],
+  euk_phylum_rank_combine_prim
+)
+
+## Order palette — ordered to match euk_order_rank_combine_prim
+order_pal <- c(
+"#7f265b","#5dbb68","#58388b","#9eb13f","#677fd8","#ca913b","#bc80d5","#45bc8d","#c9417e","#36dee6","#ba4758","#758a3c","#c25bac","#b75636","#da75a0"
+)
+order_fill <- setNames(
+  order_pal[seq_along(euk_order_rank_combine_prim)],
+  euk_order_rank_combine_prim
+)
+
+## ---- Shared zone-divider positions (reused in fig2 and fig3) ---------------
+## Midpoints of the lat gaps between the 4 map zoom boxes (a/b/c/d, N→S):
+##   a (ymin 26.75) / b (ymax 26.10) → cut 26.425
+##   b (ymin 25.05) / c (ymax 24.05) → cut 24.550
+##   c (ymin 21.90) / d (ymax 20.25) → cut 21.075
+zone_lat_cuts <- c((26.75 + 26.10) / 2,
+                   (25.05 + 24.05) / 2,
+                   (21.90 + 20.25) / 2)
+
+.ns_lat_lkp <- dat_all_filt_combine_prim %>%
+  distinct(sample_id, lat) %>%
+  inner_join(ns_sample_nums, by = "sample_id") %>%
+  arrange(sample_num_ns)
+
+zone_lines <- sapply(zone_lat_cuts, function(cut_lat) {
+  above <- .ns_lat_lkp %>% filter(lat >  cut_lat) %>%
+              slice_max(sample_num_ns, n = 1, with_ties = FALSE) %>%
+              pull(sample_num_ns)
+  below <- .ns_lat_lkp %>% filter(lat <= cut_lat) %>%
+              slice_min(sample_num_ns, n = 1, with_ties = FALSE) %>%
+              pull(sample_num_ns)
+  if (!length(above) || !length(below)) return(NA_real_)
+  (above + below) / 2
+}) %>% na.omit()
+
+## zone centre positions for letter labels (a–d), used in fig2 & fig3
+n_max_ns <- max(ns_sample_nums$sample_num_ns)
+zone_label_df <- tibble::tibble(
+  y_pos = c(mean(c(1,            zone_lines[1])),
+            mean(zone_lines[c(1, 2)]),
+            mean(zone_lines[c(2, 3)]),
+            mean(c(zone_lines[3], n_max_ns))),
+  label = c("a", "b", "c", "d")
+)
+```
+
+
+## Fig 2 — Phylum bar plots
+
+```{r fig2_phylum}
+## ensure the plots output folder exists regardless of chunk run order
+dir.create(paste0(dir, plot_file), showWarnings = FALSE, recursive = TRUE)
+
+## ---- prepare data -----------------------------------------------------------
+## Join global N→S sample numbers so y-axis positions are consistent across
+## habitat panels — gaps appear naturally where a habitat lacks samples at
+## a given latitude rank (matching manuscript Fig. 2 layout).
+plot_dat_phylum <- euk_phylum_top_combine_prim %>%
+  filter(!is.na(habitat), !is.na(Phylum)) %>%
+  left_join(ns_sample_nums, by = "sample_id") %>%
+  filter(!is.na(sample_num_ns))           # drop any samples not in filtered set
+
+## Pre-compute cumulative stacked x-positions per sample.
+## geom_col/position_stack() does not work reliably with a continuous numeric
+## y-axis (produces warnings and negative bars); geom_rect() with explicit
+## xmin/xmax fully bypasses position_stack().
+plot_dat_phylum_stk <- plot_dat_phylum %>%
+  arrange(sample_num_ns, Phylum) %>%
+  group_by(sample_num_ns, habitat) %>%
+  mutate(
+    xmax = cumsum(percent_reads),
+    xmin = xmax - percent_reads
+  ) %>%
+  ungroup()
+
+## zone_lines and zone_label_df are computed in the barplot_helpers chunk.
+
+## ---- zone letters for right-side annotation (Seagrass panel only) ----------
+## Placed at x = Inf so they sit just outside the right edge of each panel;
+## coord_cartesian(clip = "off") + wider right margin make them visible.
+## Filtering to "Seagrass" (rightmost facet) gives a single right-side axis.
+zone_label_right <- zone_label_df %>%
+  mutate(habitat = factor("Seagrass", levels = c("Coral", "Mangrove", "Seagrass")))
+
+## ---- main figure (3-panel: habitat) matching manuscript Fig. 2 -------------
+## y-axis: continuous N→S sample number (1 = northernmost).
+## facet_grid(. ~ habitat, scales = "free"): each panel has its own x and y
+##   range, so gaps appear between non-consecutive sample numbers.
+## Three dashed lines divide the plot into the 4 geographic zones from Fig. 1.
+fig2 <- ggplot(plot_dat_phylum_stk) +
+  geom_hline(yintercept = zone_lines,
+             linetype = "dashed", colour = "grey30", linewidth = 0.5) +
+  geom_rect(aes(xmin = xmin, xmax = xmax,
+                ymin = sample_num_ns - 0.40, ymax = sample_num_ns + 0.40,
+                fill = Phylum)) +
+  scale_fill_manual(values = phylum_fill, na.value = "grey85") +
+  scale_x_continuous(expand = c(0, 0),
+                     labels = scales::percent) +
+  ## Reversed so sample 1 (northernmost) sits at the top of each panel.
+  ## Integer breaks only (ceiling/floor), 0 excluded; check.overlap drops
+  ## labels that would collide at this font size.
+  scale_y_reverse(
+    breaks = function(lims) {
+      b <- seq(ceiling(min(lims)), floor(max(lims)))
+      b[b > 0]
+    },
+    expand = expansion(add = 0.5),
+    guide  = guide_axis(check.overlap = TRUE)
+  ) +
+  geom_text(data = zone_label_right,
+            aes(x = Inf, y = y_pos, label = label),
+            inherit.aes = FALSE,
+            hjust = -0.4, colour = "grey25", fontface = "bold", size = 3.5) +
+  coord_cartesian(clip = "off") +
+  facet_grid(. ~ habitat, scales = "free") +
+  labs(x = "Relative abundance (%)", y = "Sample (N \u2192 S)", fill = "Phylum") +
+  theme_bar() +
+  theme(axis.text.y  = element_text(size = 7),
+        plot.margin  = margin(5, 30, 5, 5))
+
+fig2
+
+ggsave(paste0(dir, plot_file, "/Fig2_phylum_barplot.tiff"),
+       fig2, width = 24, height = 23, units = "cm", dpi = 300)
+
+## ---- supplementary: per primer (rows = habitat, columns = primer) -----------
+## Primers paired horizontally (columns) so the two primers for each habitat
+## sit side-by-side, making within-habitat primer comparisons easy.
+##
+## Y-axis trick: convert sample_num_ns to a zero-padded character factor so
+## the axis is DISCRETE. This means:
+##   (a) facet_grid with scales="free_y" drops unused levels per row — each
+##       habitat row is only as tall as its own sample count, no blank gaps.
+##   (b) geom_col / position_stack() work correctly (they require discrete y).
+## Zero-padding ("01","02"..."10") keeps lexicographic sort == numeric sort.
+plot_dat_phylum_primer <- euk_phylum_top %>%
+  filter(!is.na(habitat), !is.na(Phylum)) %>%
+  separate(sample_id_u, c("mes1", "sample_id", "mes2"), sep = ";") %>%
+  select(-mes1, -mes2) %>%
+  left_join(ns_sample_nums, by = "sample_id") %>%
+  filter(!is.na(sample_num_ns)) %>%
+  mutate(sample_num_chr = factor(
+    sprintf("%02d", sample_num_ns),
+    levels = sprintf("%02d", sort(unique(sample_num_ns)))
+  ))
+
+## Zone lines for discrete y-axis: compute per-habitat yintercept in discrete
+## position units. With limits=rev, disc_pos 1 = bottommost bar (largest
+## sample_num_ns = southernmost); positions increase upward toward north.
+## geom_hline with a `habitat` column in the data frame makes ggplot draw the
+## line only in the correct habitat row of the facet_grid.
+zone_hline_s2 <- {
+  dp_lkp <- plot_dat_phylum_primer %>%
+    distinct(habitat, sample_num_ns) %>%
+    arrange(habitat, desc(sample_num_ns)) %>%
+    group_by(habitat) %>%
+    mutate(disc_pos = row_number()) %>%
+    ungroup()
+
+  purrr::map_dfr(zone_lines, function(zl) {
+    dp_lkp %>%
+      group_by(habitat) %>%
+      summarise(
+        ## disc_pos of the last sample on the north side of the boundary (≤ zl)
+        p_a = { s <- sample_num_ns[sample_num_ns <= zl]
+                d <- disc_pos[sample_num_ns <= zl]
+                if (length(s) == 0L) NA_real_ else d[which.max(s)] },
+        ## disc_pos of the first sample on the south side of the boundary (> zl)
+        p_b = { s <- sample_num_ns[sample_num_ns > zl]
+                d <- disc_pos[sample_num_ns > zl]
+                if (length(s) == 0L) NA_real_ else d[which.min(s)] },
+        .groups = "drop"
+      ) %>%
+      mutate(yintercept = (p_a + p_b) / 2) %>%
+      select(habitat, yintercept) %>%
+      filter(!is.na(yintercept))
+  })
+}
+
+fig_s2_primer <- ggplot(plot_dat_phylum_primer,
+                        aes(x = percent_reads, y = sample_num_chr, fill = Phylum)) +
+  geom_hline(data = zone_hline_s2,
+             aes(yintercept = yintercept),
+             inherit.aes = FALSE,
+             linetype = "dashed", colour = "grey30", linewidth = 0.5) +
+  geom_col(position = "stack", width = 0.8) +
+  scale_fill_manual(values = phylum_fill, na.value = "grey85") +
+  scale_x_continuous(expand = c(0, 0), labels = scales::percent) +
+  ## limits = rev puts "01" at top (north); drop = TRUE removes unused levels
+  ## so each habitat row only spans its own samples — no wasted vertical space.
+  scale_y_discrete(limits = rev, drop = TRUE) +
+  facet_grid(habitat ~ primer, scales = "free_y") +
+  labs(x = "Relative abundance (%)", y = "Sample (N \u2192 S)", fill = "Phylum",
+       caption = "Supplementary: phylum composition by primer pair") +
+  theme_bar(base = 10) +
+  theme(axis.text.y = element_text(size = 8),
+        strip.text  = element_text(face = "bold", size = 9))
+
+fig_s2_primer
+
+ggsave(paste0(dir, plot_file, "/FigS_phylum_barplot_by_primer.tiff"),
+       fig_s2_primer, width = 28, height = 32, units = "cm", dpi = 300)
+```
+
+
+## Fig 3 — Order bar plots
+
+```{r fig3_order}
+## ensure the plots output folder exists regardless of chunk run order
+dir.create(paste0(dir, plot_file), showWarnings = FALSE, recursive = TRUE)
+
+## ---- prepare data -----------------------------------------------------------
+plot_dat_order <- euk_order_top_combine_prim %>%
+  filter(!is.na(habitat), !is.na(Order)) %>%
+  left_join(ns_sample_nums, by = "sample_id") %>%
+  filter(!is.na(sample_num_ns))
+
+plot_dat_order_stk <- plot_dat_order %>%
+  arrange(sample_num_ns, Order) %>%
+  group_by(sample_num_ns, habitat) %>%
+  mutate(xmax = cumsum(percent_reads),
+         xmin = xmax - percent_reads) %>%
+  ungroup()
+
+## right-side zone labels for fig3 (same logic as fig2)
+zone_label_right_o <- zone_label_df %>%
+  mutate(habitat = factor("Seagrass", levels = c("Coral", "Mangrove", "Seagrass")))
+
+## ---- main figure (3-panel: habitat) ----------------------------------------
+fig3 <- ggplot(plot_dat_order_stk) +
+  geom_hline(yintercept = zone_lines,
+             linetype = "dashed", colour = "grey30", linewidth = 0.5) +
+  geom_rect(aes(xmin = xmin, xmax = xmax,
+                ymin = sample_num_ns - 0.40, ymax = sample_num_ns + 0.40,
+                fill = Order)) +
+  geom_text(data = zone_label_right_o,
+            aes(x = Inf, y = y_pos, label = label),
+            inherit.aes = FALSE,
+            hjust = -0.4, colour = "grey25", fontface = "bold", size = 3.5) +
+  coord_cartesian(clip = "off") +
+  scale_fill_manual(values = order_fill, na.value = "grey85") +
+  scale_x_continuous(expand = c(0, 0), labels = scales::percent) +
+  scale_y_reverse(
+    breaks = function(lims) { b <- seq(ceiling(min(lims)), floor(max(lims))); b[b > 0] },
+    expand = expansion(add = 0.5),
+    guide  = guide_axis(check.overlap = TRUE)
+  ) +
+  facet_grid(. ~ habitat, scales = "free") +
+  labs(x = "Relative abundance (%)", y = "Sample (N \u2192 S)", fill = "Order") +
+  theme_bar() +
+  theme(axis.text.y = element_text(size = 7),
+        plot.margin  = margin(5, 30, 5, 5))
+
+fig3
+
+ggsave(paste0(dir, plot_file, "/Fig3_order_barplot.tiff"),
+       fig3, width = 24, height = 23, units = "cm", dpi = 300)
+
+
+
+## ---- supplementary: per primer (rows = habitat, columns = primer) -----------
+## Same discrete-y trick as fig_s2_primer: zero-padded character factor so
+## each habitat row only occupies as many bars as it has samples.
+plot_dat_order_primer <- euk_order_top %>%
+  filter(!is.na(habitat), !is.na(Order)) %>%
+  separate(sample_id_u, c("mes1", "sample_id", "mes2"), sep = ";") %>%
+  select(-mes1, -mes2) %>%
+  left_join(ns_sample_nums, by = "sample_id") %>%
+  filter(!is.na(sample_num_ns)) %>%
+  mutate(sample_num_chr = factor(
+    sprintf("%02d", sample_num_ns),
+    levels = sprintf("%02d", sort(unique(sample_num_ns)))
+  ))
+
+## Zone lines for fig_s3_primer discrete y-axis (same approach as fig_s2_primer)
+zone_hline_s3 <- {
+  dp_lkp <- plot_dat_order_primer %>%
+    distinct(habitat, sample_num_ns) %>%
+    arrange(habitat, desc(sample_num_ns)) %>%
+    group_by(habitat) %>%
+    mutate(disc_pos = row_number()) %>%
+    ungroup()
+
+  purrr::map_dfr(zone_lines, function(zl) {
+    dp_lkp %>%
+      group_by(habitat) %>%
+      summarise(
+        p_a = { s <- sample_num_ns[sample_num_ns <= zl]
+                d <- disc_pos[sample_num_ns <= zl]
+                if (length(s) == 0L) NA_real_ else d[which.max(s)] },
+        p_b = { s <- sample_num_ns[sample_num_ns > zl]
+                d <- disc_pos[sample_num_ns > zl]
+                if (length(s) == 0L) NA_real_ else d[which.min(s)] },
+        .groups = "drop"
+      ) %>%
+      mutate(yintercept = (p_a + p_b) / 2) %>%
+      select(habitat, yintercept) %>%
+      filter(!is.na(yintercept))
+  })
+}
+
+fig_s3_primer <- ggplot(plot_dat_order_primer,
+                        aes(x = percent_reads, y = sample_num_chr, fill = Order)) +
+  geom_hline(data = zone_hline_s3,
+             aes(yintercept = yintercept),
+             inherit.aes = FALSE,
+             linetype = "dashed", colour = "grey30", linewidth = 0.5) +
+  geom_col(position = "stack", width = 0.8) +
+  scale_fill_manual(values = order_fill, na.value = "grey85") +
+  scale_x_continuous(expand = c(0, 0), labels = scales::percent) +
+  scale_y_discrete(limits = rev, drop = TRUE) +
+  facet_grid(habitat ~ primer, scales = "free_y") +
+  labs(x = "Relative abundance (%)", y = "Sample (N \u2192 S)", fill = "Order",
+       caption = "Supplementary: top 15 orders by primer pair") +
+  theme_bar(base = 10) +
+  theme(axis.text.y = element_text(size = 8),
+        strip.text  = element_text(face = "bold", size = 9))
+
+fig_s3_primer
+
+ggsave(paste0(dir, plot_file, "/FigS_order_barplot_by_primer.tiff"),
+       fig_s3_primer, width = 28, height = 32, units = "cm", dpi = 300)
+```
+
+
+## Fig — Metazoan class bar plots
+
+```{r fig_metaz_class}
+## ---- rebuild metazoan data without minimum-reads filter --------------------
+## Includes all samples with any metazoan reads; pools to Class level.
+metaz_zone_base <- euk_order_combine_prim %>%
+  filter(grepl(metaz_pat, Phylum), !is.na(habitat),
+         !is.na(Class), Class != "NA", trimws(Class) != "") %>%
+  group_by(sample_id, lat, lon, habitat, Phylum, Class) %>%
+  summarise(percent_reads = sum(percent_reads), .groups = "drop") %>%
+  group_by(sample_id) %>%
+  mutate(sum_metaz = sum(percent_reads)) %>%
+  ungroup() %>%
+  filter(sum_metaz > 0) %>%
+  mutate(percent_reads = percent_reads / sum_metaz * 100)
+
+## ---- top 15 classes by median across samples --------------------------------
+metaz_class_rank <- metaz_zone_base %>%
+  group_by(Class) %>%
+  summarise(median = median(percent_reads), n = n(), .groups = "drop") %>%
+  arrange(desc(median)) %>%
+  filter(n > 3) %>%
+  slice_head(n = 15) %>%
+  pull(Class)
+
+## Colour palette keyed to class rank
+metaz_class_fill <- setNames(order_pal[seq_along(metaz_class_rank)], metaz_class_rank)
+
+## ---- filter to top 15 and assign zones --------------------------------------
+metaz_zone_base <- metaz_zone_base %>%
+  filter(Class %in% metaz_class_rank) %>%
+  mutate(
+    Class    = factor(Class, levels = metaz_class_rank),
+    zone_agg = case_when(
+      lat > zone_lat_cuts[1] ~ "a",
+      lat > zone_lat_cuts[2] ~ "b",
+      lat > zone_lat_cuts[3] ~ "c",
+      TRUE                   ~ "d"
+    ),
+    zone_agg = factor(zone_agg, levels = c("d", "c", "b", "a")),
+    habitat  = factor(habitat, levels = c("Coral", "Mangrove", "Seagrass"))
+  )
+
+## ---- mean: each sample weighted equally ------------------------------------
+metaz_zone_mean <- metaz_zone_base %>%
+  group_by(zone_agg, habitat, Class) %>%
+  summarise(percent_reads = mean(percent_reads), .groups = "drop") %>%
+  mutate(method = "Mean (equal sample weight)")
+
+## ---- pooled sum: pool reads across samples, renormalize to 100% ------------
+metaz_zone_pool <- metaz_zone_base %>%
+  group_by(zone_agg, habitat, Class) %>%
+  summarise(reads_sum = sum(percent_reads), .groups = "drop") %>%
+  group_by(zone_agg, habitat) %>%
+  mutate(percent_reads = reads_sum / sum(reads_sum) * 100) %>%
+  ungroup() %>%
+  mutate(method = "Pooled sum (renormalized)")
+
+metaz_zone_both <- bind_rows(metaz_zone_mean, metaz_zone_pool) %>%
+  mutate(method = factor(method,
+           levels = c("Mean (equal sample weight)", "Pooled sum (renormalized)")))
+
+## ---- figure (2-row × 3-column: method × habitat) ---------------------------
+fig_metaz_zone <- ggplot(metaz_zone_both,
+                         aes(x = percent_reads, y = zone_agg, fill = Class)) +
+  geom_col(position = "stack", width = 0.65) +
+  scale_fill_manual(values = metaz_class_fill, na.value = "grey85") +
+  scale_x_continuous(expand = c(0, 0),
+                     labels = scales::label_number(suffix = "%")) +
+  facet_grid(method ~ habitat, scales = "free_x") +
+  labs(x = "Relative abundance (% of Metazoa)",
+       y = "Zone (N → S)",
+       fill = "Class") +
+  theme_bar() +
+  theme(strip.text = element_text(face = "bold", size = 9),
+        axis.text.y = element_text(size = 10))
+
+fig_metaz_zone
+
+ggsave(paste0(dir, plot_file, "/Fig_metaz_class_zone.tiff"),
+       fig_metaz_zone, width = 28, height = 18, units = "cm", dpi = 300)
+```
+
+
+## Venn diagram
+```{r ven_dia}
+
+## by Genus
+dat_v <-euk_genus_combine_prim
+
+dat_v <- list(
+  Coral = as.character(dat_v$Genus[dat_v$habitat=="Coral"]), 
+  Mangrove = as.character(dat_v$Genus[dat_v$habitat=="Mangrove"]), 
+  Seagrass = as.character(dat_v$Genus[dat_v$habitat=="Seagrass"])
+  )
+
+ ven_genus <-  ggvenn::ggvenn(dat_v,  fill_color = c("#7f265b","#5dbb68","#58388b"),
+  set_name_size = 4, fill_alpha = 0.35, stroke_color="white", stroke_alpha=0.5, stroke_size=0.4)
+ 
+ 
+ 
+ ## by Species
+dat_v <-dat_all_filt_combine_prim 
+
+dat_v <- list(
+  Coral = as.character(dat_v$Species[dat_v$habitat=="Coral"]), 
+  Mangrove = as.character(dat_v$Species[dat_v$habitat=="Mangrove"]), 
+  Seagrass = as.character(dat_v$Species[dat_v$habitat=="Seagrass"])
+  )
+
+ ven_species <-  ggvenn::ggvenn(dat_v,  fill_color = c("#7f265b","#5dbb68","#58388b"),
+  set_name_size = 4, fill_alpha = 0.35, stroke_color="white", stroke_alpha=0.5, stroke_size=0.4)
+ 
+ 
+ 
+ 
+ 
+
+```
+
+
+
+
+## Richness and diversity stats
+tests can take 40 min, run caffeinate -dims in terminal to keep computer awake, then CTRL+c to stop
+```{r stat}
+
+#### stats  ######
+
+## Richness and Shannon recalculated from combined-primer data, matching the
+## method in Red_Sea_post_DADA2_filter_and_tidy.Rmd:
+##   rich_rare     = number of taxa with percent_reads > 0 per sample
+##   shan_div_rare = vegan::diversity() on wide-format percent_reads matrix
+comb_wide <- dat_all_filt_combine_prim %>%
+  select(sample_id, lineage, percent_reads) %>%
+  tidyr::pivot_wider(names_from = lineage, values_from = percent_reads, values_fill = 0)
+
+rich_shan <- tibble::tibble(
+  sample_id     = comb_wide$sample_id,
+  rich_rare     = rowSums(comb_wide[, -1] > 0),
+  shan_div_rare = vegan::diversity(comb_wide[, -1], index = "shannon")
+)
+
+sdat <- dat_all_filt_combine_prim %>%
+  distinct(sample_id, .keep_all = TRUE) %>%
+  select(sample_id, year, season, area, habitat, lat, lon, depth) %>%
+  left_join(rich_shan, by = "sample_id") %>%
+  left_join(
+    env %>% dplyr::select(sample_ID, sst_mean, SST_range, pp_mean, pp_range,
+                          salinity, nitrate, land_distance, PAR),
+    by = c("sample_id" = "sample_ID")
+  ) %>%
+  mutate(Latitude = lat, Longitude = lon,
+         sample_id = as.factor(sample_id), area = as.factor(area)) %>%
+  # mutate(y = rich_rare) # rich_rare or shan_div_rare
+  mutate(y = rich_rare)
+  
+# levels(sdat$sample_id)  levels(sdat$area)
+
+###scale scale=TRUE divides by the standard deviation default does both center and scale
+names(sdat)
+sdat$sTemp<-scale(sdat$sst_mean)
+sdat$sSST_range<-scale(sdat$SST_range)
+sdat$sland_distance<-scale(sdat$land_distance)
+sdat$slat<-scale(sdat$lat)
+sdat$spp<-scale(sdat$pp_mean)
+sdat$spp_range<-scale(sdat$pp_range)
+sdat$ssalinity<-scale(sdat$salinity)
+sdat$snitrate<-scale(sdat$nitrate)
+sdat$sPAR<-scale(sdat$PAR)
+
+## drop rows missing any model variable or response (required by na.action="na.fail" / dredge)
+sdat <- sdat %>% filter(complete.cases(y, sTemp, snitrate, spp_range, sland_distance))
+```
+
+## Richness LMM and spatial diagnostics
+Exploratory analyses — not manuscript figures or tables. Set eval=FALSE for faster knitting.
+VIF for manyglm predictors: all < 3 (confirmed). Spatial weights (us.nb4/us.wt4) retained
+for reference but not used in current analysis. LMM dredge confirms no random effect needed.
+```{r stat_exploratory, eval=FALSE}
+## VIF checks
+HH::vif(xx = as.data.frame(sdat[ , c("slat","sTemp","sSST_range","snitrate","spp","spp_range","ssalinity","sland_distance")]))
+HH::vif(xx = as.data.frame(sdat[ , c("sTemp","snitrate","spp_range","sland_distance")]))
+
+## Richness distribution
+x <- sdat$rich_rare
+hist(x); hist(sqrt(x)); hist(log(x))
+
+## Spatial weights (k=8 nearest neighbours) — built for potential SAR models
+ssdat  <- sdat
+coords <- cbind(ssdat$Longitude, ssdat$Latitude)
+us.nb4 <- knn2nb(knearneigh(coords, k = 8))
+us.wt4 <- nb2listw(us.nb4, style = "W")
+
+## Richness LMM — model selection via dredge
+lmer.mod.1 <- lmer(y ~ habitat + sTemp + snitrate + spp_range + sland_distance
+                   + (1|season), data = sdat, na.action = "na.fail", REML = FALSE)
+lmer.mod.2 <- lm(y ~ habitat + sTemp + snitrate + spp_range + sland_distance,
+                 data = sdat, na.action = "na.fail")
+AICs <- c(AIC(lmer.mod.1), AIC(lmer.mod.2)); AICs
+# best model is without random factor
+
+dred <- MuMIn::dredge(lmer.mod.2)
+subset(dred, delta == 0)
+
+lmer.mod <- lm(y ~ habitat + sTemp + snitrate + spp_range + sland_distance,
+               data = sdat, na.action = "na.fail")
+summary(lmer.mod)
+MuMIn::r.squaredGLMM(lmer.mod)
+
+## Residual diagnostics
+mod <- lmer.mod
+hist(resid(mod))
+plot(fitted(mod), resid(mod)); abline(0, 0)
+qqnorm(resid(mod)); qqline(resid(mod))
+```
+
+
+## Community matrix
+
+```{r community_matrix}
+## ---- presence/absence community matrix (samples × OTUs) --------------------
+## Use combined-primer data; 1 = OTU detected in sample, 0 = absent.
+## Presence/absence reduces the influence of highly variable read counts
+## and is consistent with the Arctic paper (binomial manyglm).
+comm_pa <- dat_all_filt_combine_prim %>%
+  filter(type == "sample") %>%
+  select(sample_id, lineage, percent_reads) %>%
+  group_by(sample_id, lineage) %>%
+  summarise(pres = as.integer(sum(percent_reads, na.rm = TRUE) > 0),
+            .groups = "drop") %>%
+  pivot_wider(names_from  = lineage,
+              values_from = pres,
+              values_fill = 0L) %>%
+  column_to_rownames("sample_id")
+
+## ---- align env data rows to community matrix rows --------------------------
+## sdat was built in the stat chunk; subset to samples present in comm_pa.
+env_mva <- sdat %>%
+  ungroup() %>%
+  filter(as.character(sample_id) %in% rownames(comm_pa)) %>%
+  arrange(match(as.character(sample_id), rownames(comm_pa))) %>%
+  as.data.frame()
+
+## reorder community matrix rows to match env_mva
+comm_pa <- comm_pa[as.character(env_mva$sample_id), ]
+
+## remove OTUs present in fewer than 5 samples (~6% occurrence; colSums >= 2
+## is effectively no filter — all 493 taxa already pass it)
+comm_pa <- comm_pa[, colSums(comm_pa) >= 5]
+
+cat("Community matrix:", nrow(comm_pa), "samples ×", ncol(comm_pa), "OTUs\n")
+```
+
+
+## manyglm analysis
+
+```{r manyglm_fit}
+## ---- set reference level: Coral ---------------------------------------------
+## Explicit relevel so habitatMangrove = Mangrove vs Coral,
+## habitatSeagrass = Seagrass vs Coral in all model output.
+env_mva$habitat <- relevel(factor(env_mva$habitat), ref = "Coral")
+
+## ---- model 1: Coral reference (for Table 1 + Mangrove/Seagrass vs Coral) ---
+mva_dat <- mvabund(comm_pa)
+
+mva_mod <- manyglm(
+  mva_dat ~ habitat + sTemp + snitrate + spp_range + sland_distance,
+  data   = env_mva,
+  family = binomial("cloglog"),
+  nCore  = 4
+)
+summary(mva_mod)
+## mva_aov: multivariate only — fast, used for Table 1.
+## nBoot=999 for publication; 99 for dev runs.
+mva_aov <- anova(mva_mod,
+                 resamp   = "pit.trap",
+                 test     = "score",
+                 cor.type = "shrink",
+                 nBoot    = 999,
+                 p.uni    = "none")
+
+## anova for model 1: gives per-dummy p-values (habitatMangrove, habitatSeagrass)
+## correctly for this model. summary is NOT used here — it applies a more
+## conservative cross-coefficient adjustment that washes out significance.
+mva_aov_uni <- anova(mva_mod,
+                     resamp   = "pit.trap",
+                     test     = "score",
+                     cor.type = "shrink",
+                     nBoot    = 999,
+                     p.uni    = "adjusted")
+
+## ---- model 2: rebuild everything from scratch with Mangrove as reference ----
+## Completely independent objects (comm_pa2, env_mva2, mva_dat2) to eliminate
+## any state carried over from model 1.
+comm_pa2 <- dat_all_filt_combine_prim %>%
+  filter(type == "sample") %>%
+  select(sample_id, lineage, percent_reads) %>%
+  group_by(sample_id, lineage) %>%
+  summarise(pres = as.integer(sum(percent_reads, na.rm = TRUE) > 0),
+            .groups = "drop") %>%
+  pivot_wider(names_from  = lineage,
+              values_from = pres,
+              values_fill = 0L) %>%
+  column_to_rownames("sample_id")
+
+env_mva2 <- sdat %>%
+  ungroup() %>%
+  filter(as.character(sample_id) %in% rownames(comm_pa2)) %>%
+  arrange(match(as.character(sample_id), rownames(comm_pa2))) %>%
+  as.data.frame()
+
+comm_pa2 <- comm_pa2[as.character(env_mva2$sample_id), ]
+comm_pa2 <- comm_pa2[, colSums(comm_pa2) >= 5]
+
+env_mva2$habitat <- relevel(factor(env_mva2$habitat), ref = "Mangrove")
+
+mva_dat2 <- mvabund(comm_pa2)
+
+mva_mod2 <- manyglm(
+  mva_dat2 ~ habitat + sTemp + snitrate + spp_range + sland_distance,
+  data   = env_mva2,
+  family = binomial("cloglog")
+)
+
+mva_aov_uni2 <- anova(mva_mod2,
+                      resamp   = "pit.trap",
+                      test     = "score",
+                      cor.type = "shrink",
+                      nBoot    = 999,
+                      p.uni    = "adjusted")
+
+```
+
+
+## Table 1 — display
+
+```{r table1_manyglm}
+## Column names from mvabund anova table: Res.Df, Df.diff, score, Pr(>score)
+tab1_raw <- as.data.frame(mva_aov$table) %>%
+  rownames_to_column("variable") %>%
+  filter(variable != "(Intercept)") %>%
+  rename(
+    `Res. DF`  = Res.Df,
+    `d.f.`     = Df.diff,
+    `Score`    = score,
+    `p-value`  = `Pr(>score)`
+  ) %>%
+  mutate(
+    `Score`   = round(`Score`,   2),
+    `p-value` = round(`p-value`, 3),
+    variable  = dplyr::recode(variable,
+      habitat        = "Habitat",
+      sTemp          = "SST (mean)",
+      snitrate       = "Nitrate",
+      spp_range      = "Primary productivity (range)",
+      sland_distance = "Distance to shore"
+    )
+  )
+
+kable(tab1_raw,
+      caption = paste("Table 1. Summary of the multivariate generalised linear",
+                      "model assessing the association between the eDNA eukaryote",
+                      "community and environmental variables."),
+      col.names = c("Variable", "Res. DF", "d.f.", "Score", "p-value"),
+      align     = c("l", "r", "r", "r", "r"),
+      format    = "html") %>%
+  kable_styling(full_width = FALSE, bootstrap_options = NULL) %>%
+  row_spec(0, extra_css = "border-bottom: 1px solid black;") %>%
+  row_spec(seq_len(nrow(tab1_raw)), extra_css = "border: none;")
+
+write.csv(tab1_raw,
+          paste0(dir, export_file, "Table1_manyglm.csv"),
+          row.names = FALSE)
+```
+
+## Table 1 — Word version
+```{r table1_word}
+flextable(tab1_raw) %>%
+  set_header_labels(variable = "Variable") %>%
+  set_caption(caption = paste(
+    "Table 1. Summary of the multivariate generalised linear model (manyglm,",
+    "binomial cloglog) assessing the association between the eDNA eukaryote",
+    "community and environmental variables.")) %>%
+  colformat_num(j = c("Res. DF", "d.f."), digits = 0) %>%
+  colformat_num(j = "Score",   digits = 2) %>%
+  colformat_num(j = "p-value", digits = 3) %>%
+  align(j = 1,   align = "left",  part = "all") %>%
+  align(j = 2:5, align = "right", part = "all") %>%
+  theme_booktabs() %>%
+  autofit()
+```
+
+
+## Fig 4 — Multivariate GLM plot
+
+```{r multivar_plot_ggplot, warning=FALSE}
+t         <- mva_mod
+t.an      <- mva_aov_uni
+taxa_file <- dat_all_filt_combine_prim
+
+## variable display order and axis labels
+## Two habitat contrasts from model 1 (Coral ref) + SvM from model 2 (Mangrove ref).
+var_order <- c("habitatMangrove", "habitatSeagrass", "SvM",
+               "sTemp", "snitrate", "spp_range", "sland_distance")
+x_labels  <- c("Mangrove vs Coral", "Seagrass vs Coral", "Seagrass vs Mangrove",
+               "SST mean", "Nitrate", "Prim. prod. range", "Dist. to shore")
+
+## p_min_val is auto-calculated below to display ~15 taxa
+num_clust  <- 5            # hierarchical clusters for y-axis colour grouping
+ccll       <- c(wesanderson::wes_palette("Moonrise2", n = 2), "black")  # matches Arctic
+pal3       <- wesanderson::wes_palette("Zissou1", 3, type = "continuous")  # dot colours
+col_sig    <- c("not significant" = "grey85", "significant" = "grey40")  # explicit mapping
+
+## ── Extract model 1 components ───────────────────────────────────────────────
+## anova$uni.test: rows = predictors, cols = taxa — transpose to get rows = taxa
+t.coef <- coef(t)
+t.ts   <- t(t.an$uni.test)   # rows = taxa, cols = predictors
+t.p    <- t(t.an$uni.p)
+
+## test statistic (long format)
+mult_dat <- data.frame(t.ts) %>%
+  rownames_to_column("lineage") %>%
+  select(-any_of(c("X.Intercept.", "X.Intercept"))) %>%
+  pivot_longer(-lineage, names_to = "variable", values_to = "test_stat")
+
+## p-value (long)
+mult_dat_p <- data.frame(t.p) %>%
+  rownames_to_column("lineage") %>%
+  select(-any_of(c("X.Intercept.", "X.Intercept"))) %>%
+  pivot_longer(-lineage, names_to = "variable", values_to = "p.value")
+
+## coefficient (long)
+mult_dat_c <- data.frame(t(t.coef)) %>%
+  rownames_to_column("lineage") %>%
+  select(-any_of(c("X.Intercept.", "X.Intercept"))) %>%
+  pivot_longer(-lineage, names_to = "variable", values_to = "coef")
+
+## ── Expand combined "habitat" anova row into two named contrast rows ----------
+## anova tests habitat as a 2-df term; duplicate that row so both contrasts
+## appear as columns in the plot. Coefficient direction comes from coef() below.
+expand_hab <- function(df) {
+  hab <- df %>% filter(variable == "habitat")
+  bind_rows(
+    df %>% filter(variable != "habitat"),
+    hab %>% mutate(variable = "habitatMangrove"),
+    hab %>% mutate(variable = "habitatSeagrass")
+  )
+}
+mult_dat   <- expand_hab(mult_dat)
+mult_dat_p <- expand_hab(mult_dat_p)
+
+## ── Add Seagrass vs Mangrove from model 2 anova ──────────────────────────────
+## Tile significance: combined 2-df habitat row from mva_aov_uni2 (same test
+## as MvC/SvC but from model 2). Coefficient direction: habitatSeagrass in
+## model 2 = Seagrass vs Mangrove contrast (Mangrove is reference).
+svM_ts <- data.frame(t(mva_aov_uni2$uni.test)) %>%
+  rownames_to_column("lineage") %>%
+  select(lineage, test_stat = habitat) %>%
+  mutate(variable = "SvM") %>%
+  filter(lineage %in% mult_dat$lineage)
+
+svM_p <- data.frame(t(mva_aov_uni2$uni.p)) %>%
+  rownames_to_column("lineage") %>%
+  select(lineage, p.value = habitat) %>%
+  mutate(variable = "SvM") %>%
+  filter(lineage %in% mult_dat$lineage)
+
+svM_c <- data.frame(t(coef(mva_mod2))) %>%
+  rownames_to_column("lineage") %>%
+  select(lineage, coef = habitatSeagrass) %>%
+  mutate(variable = "SvM") %>%
+  filter(lineage %in% mult_dat$lineage)
+
+mult_dat   <- bind_rows(mult_dat,   svM_ts)
+mult_dat_p <- bind_rows(mult_dat_p, svM_p)
+mult_dat_c <- bind_rows(mult_dat_c, svM_c)
+## ── Auto-select p_min_val to display ~n_target taxa --------------------------
+n_target  <- 15
+p_min_val <- mult_dat_p %>%
+  group_by(lineage) %>%
+  summarise(min_p = min(p.value, na.rm = TRUE), .groups = "drop") %>%
+  arrange(min_p) %>%
+  slice(min(n_target, n())) %>%
+  pull(min_p)
+cat("p_min_val =", round(p_min_val, 4), "| taxa displayed:", n_target, "\n")
+
+## join; keep taxa with at least one predictor at p ≤ p_min_val
+mult_dat2 <- mult_dat %>%
+  left_join(mult_dat_p, by = c("lineage", "variable")) %>%
+  left_join(mult_dat_c, by = c("lineage", "variable")) %>%
+  group_by(lineage) %>%
+  filter(any(p.value <= p_min_val)) %>%
+  ungroup() %>%
+  mutate(
+    p_val_col = if_else(p.value <= 0.05, "significant", "not significant"),
+    coef_log  = if_else(coef >= 0, log(coef + 1), -log(abs(coef) + 1))
+  )
+
+## ── Hierarchical clustering of taxa by coefficient ───────────────────────────
+## Cluster on continuous predictors only — habitat dummies excluded as they
+## represent contrasts vs reference level, not a continuous gradient.
+cont_pred <- c("sTemp", "snitrate", "spp_range", "sland_distance")
+clus <- t(t.coef)[, cont_pred, drop = FALSE]
+clus <- clus[match(unique(mult_dat2$lineage), rownames(clus)), , drop = FALSE]
+
+hc      <- hclust(sqrt(dist(clus)))
+plot(hc, main = "Taxa dendrogram (coefficient distances)")
+rect.hclust(hc, k = num_clust)
+
+clgroup <- data.frame(group = cutree(hc, k = num_clust)) %>%
+  rownames_to_column("lineage")
+ccc     <- data.frame(group = seq_len(num_clust),
+                      color = rep(ccll, length.out = num_clust))
+
+clustorder <- clgroup %>%
+  left_join(ccc, by = "group") %>%
+  mutate(taxa_cluster_arrange = as.integer(
+    factor(lineage, levels = hc$labels[hc$order])
+  ))
+
+## ── Y-axis labels: Phylum;Order;Family;Genus ─────────────────────────────────
+## Row names in t.p are R-safe lineage strings (;→. space→. -→.).
+## Create matching 'lineage_stat' from the original lineage column to join.
+rn <- data.frame(lineage_stat = rownames(t.p))
+
+y_labels_make <- taxa_file %>%
+  ungroup() %>%
+  select(lineage:Species) %>%
+  distinct(lineage, .keep_all = TRUE) %>%
+  mutate(lineage_stat = make.names(lineage)) %>%
+  inner_join(rn, by = "lineage_stat") %>%
+  unite(y_labels, Phylum:Genus, sep = ";", remove = FALSE) %>%
+  mutate(y_labels = gsub("Eukaryota", "Unclassified", y_labels),
+         y_labels = gsub("NA",        "Unclassified", y_labels))
+
+y_labels <- clustorder %>%
+  left_join(y_labels_make, by = c("lineage" = "lineage_stat")) %>%
+  arrange(taxa_cluster_arrange) %>%
+  mutate(y_labels = if_else(is.na(y_labels), lineage, y_labels))
+
+## ── Build plotting data ───────────────────────────────────────────────────────
+## Convert variable to factor and drop rows not in var_order (e.g. combined
+## 'habitat' term if anova didn't expand dummies), then derive xx/yy from
+## factor integers — robust to any number of variables per taxon.
+mult_dat3 <- mult_dat2 %>%
+  left_join(clustorder, by = "lineage") %>%
+  mutate(variable = factor(variable, levels = var_order)) %>%
+  filter(!is.na(variable)) %>%
+  arrange(taxa_cluster_arrange, variable) %>%
+  mutate(
+    xx = as.integer(variable),
+    yy = as.integer(factor(lineage, levels = unique(lineage)))
+  )
+
+cat("Variables in plot:", paste(sort(unique(as.character(mult_dat3$variable))), collapse=", "), "\n")
+cat("Taxa in plot:", n_distinct(mult_dat3$lineage), "\n")
+
+## ── Plot ─────────────────────────────────────────────────────────────────────
+upper_coef <- 0.9
+lower_coef <- -upper_coef
+dd         <- 2   # divisor for intermediate legend breaks
+
+mult_plot <- ggplot(mult_dat3, aes(xx, yy)) +
+  geom_tile(aes(fill = p_val_col), colour = "grey50") +
+  scale_fill_manual(values = col_sig, na.value = "grey85") +
+  geom_point(aes(colour = coef_log, size = test_stat)) +
+  scale_color_gradientn(
+    name   = "Coefficient",
+    colors = pal3,
+    space  = "Lab",
+    values = scales::rescale(c(lower_coef * 1.1, lower_coef / 9, 0,
+                               upper_coef / 9,   upper_coef * 1.1)),
+    limits = c(lower_coef * 1.1, upper_coef * 1.1),
+    breaks = c(lower_coef, lower_coef / dd, 0, upper_coef / dd, upper_coef),
+    labels = round(c(-(exp(abs(lower_coef)) - 1),
+                     -(exp(abs(lower_coef / dd)) - 1),
+                     0,
+                      (exp(upper_coef / dd) - 1),
+                      (exp(upper_coef) - 1)), 1),
+    oob    = scales::squish
+  ) +
+  scale_size(name = "Score stat") +
+  scale_x_continuous(name = NULL,
+                     breaks = seq_along(levels(mult_dat3$variable)),
+                     labels = x_labels[seq_along(levels(mult_dat3$variable))],
+                     guide  = guide_axis(angle = 45)) +
+  scale_y_continuous(name = NULL,
+                     breaks = seq_along(y_labels$y_labels),
+                     labels = y_labels$y_labels,
+                     expand = expansion(add = 0.5)) +
+  guides(fill = "none") +
+  theme_minimal() +
+  theme(
+    axis.text.x  = element_text(angle = 45, hjust = 1, vjust = 1),
+    axis.text.y  = element_text(colour = y_labels$color),
+    axis.ticks   = element_blank(),
+    panel.grid   = element_blank()
+  )
+
+mult_plot
+
+ggsave(mult_plot,
+       file   = paste0(dir, plot_file, "/Fig4_multvar_taxa_presabs.tiff"),
+       width  = 20, height = 25, units = "cm", dpi = "print")
+```
+
+
+## NMDS and ordisurf GAMs
+
+```{r nmds_gam}
+## ---- NMDS on Bray-Curtis (log-transformed percent reads) -------------------
+comm_pct <- dat_all_filt_combine_prim %>%
+  filter(type == "sample") %>%
+  select(sample_id, lineage, percent_reads) %>%
+  group_by(sample_id, lineage) %>%
+  summarise(percent_reads = sum(percent_reads, na.rm = TRUE), .groups = "drop") %>%
+  pivot_wider(names_from  = lineage,
+              values_from = percent_reads,
+              values_fill = 0) %>%
+  column_to_rownames("sample_id")
+
+comm_pct <- comm_pct[as.character(env_mva$sample_id), ]
+comm_pct <- comm_pct[, colSums(comm_pct > 0) >= 2]
+
+## log(x+1) transformation then Bray-Curtis (as in Arctic paper)
+nmds_res <- metaMDS(log1p(comm_pct),
+                    distance      = "bray",
+                    trymax        = 100,
+                    autotransform = FALSE,
+                    trace         = FALSE)
+
+cat("NMDS stress:", round(nmds_res$stress, 3), "\n")
+## Stress < 0.1 = good; 0.1-0.2 = fair; > 0.2 = poor
+
+## ---- individual GAMs via ordisurf ------------------------------------------
+## All continuous env variables run individually; habitat excluded (categorical,
+## already in manyglm). Raw (unscaled) values used; ordisurf scales internally.
+## Variables removed from manyglm due to covariance are included here to show
+## non-linear gradients alongside the manyglm set.
+env_vars_gam <- list(
+  "Latitude"                     = env_mva$lat,
+  "SST (mean)"                   = env_mva$sst_mean,
+  "SST (range)"                  = env_mva$SST_range,
+  "Nitrate"                      = env_mva$nitrate,
+  "Primary productivity (mean)"  = env_mva$pp_mean,
+  "Primary productivity (range)" = env_mva$pp_range,
+  "Salinity"                     = env_mva$salinity,
+  "Distance to shore"            = env_mva$land_distance
+)
+
+ordisurf_fits <- list()
+
+tab2_raw <- lapply(names(env_vars_gam), function(v) {
+  vals <- env_vars_gam[[v]]
+  if (sum(!is.na(vals)) < 5) return(NULL)
+  surf <- ordisurf(nmds_res, vals, plot = FALSE, bs = "tp")
+  ordisurf_fits[[v]] <<- surf  # <<- needed: lapply creates child env; list lives in parent
+  s  <- summary(surf)
+  st <- s$s.table
+  data.frame(
+    variable           = v,
+    Est.DF             = round(st[1, "edf"],    2),
+    Ref.DF             = round(st[1, "Ref.df"], 2),
+    F.value            = round(st[1, "F"],      2),
+    p.value            = round(st[1, "p-value"],4),
+    deviance_explained = round(s$dev.expl * 100, 1),
+    stringsAsFactors   = FALSE
+  )
+}) %>% bind_rows()
+```
+
+
+## Table 2 — NMDS and GAM
+
+```{r table2_gam}
+kable(tab2_raw,
+      caption = paste("Table 2. Summary output of individually run generalised",
+                      "additive models (thin-plate spline). The dependent variable",
+                      "is the eDNA eukaryote community (NMDS, Bray-Curtis on",
+                      "log-transformed percent reads). Stress =",
+                      round(nmds_res$stress, 3), ".",
+                      "Variables not included in the manyglm model due to",
+                      "covariance (latitude, SST range, primary productivity mean,",
+                      "salinity) are included here to show non-linear gradients."),
+      col.names = c("Variable", "Est. DF", "Ref. DF",
+                    "F value", "p-value", "Deviance explained (%)"),
+      align     = c("l", "r", "r", "r", "r", "r"),
+      format    = "html") %>%
+  kable_styling(full_width = FALSE, bootstrap_options = NULL) %>%
+  row_spec(0, extra_css = "border-bottom: 1px solid black;") %>%
+  row_spec(seq_len(nrow(tab2_raw)), extra_css = "border: none;")
+
+write.csv(tab2_raw,
+          paste0(dir, export_file, "Table2_GAM.csv"),
+          row.names = FALSE)
+```
+
+## Table 2 — Word version
+```{r table2_word}
+flextable(tab2_raw) %>%
+  set_header_labels(
+    variable           = "Variable",
+    Est.DF             = "Est. DF",
+    Ref.DF             = "Ref. DF",
+    F.value            = "F value",
+    p.value            = "p-value",
+    deviance_explained = "Deviance explained (%)"
+  ) %>%
+  set_caption(caption = paste(
+    "Table 2. Summary of individually run generalised additive models",
+    "(thin-plate spline GAM). Dependent variable: eDNA eukaryote community",
+    "(NMDS, Bray-Curtis on log-transformed percent reads). NMDS stress =",
+    round(nmds_res$stress, 3), ".")) %>%
+  colformat_num(j = c("Est.DF", "Ref.DF"), digits = 2) %>%
+  colformat_num(j = "F.value",            digits = 2) %>%
+  colformat_num(j = "p.value",            digits = 4) %>%
+  colformat_num(j = "deviance_explained", digits = 1) %>%
+  align(j = 1,   align = "left",  part = "all") %>%
+  align(j = 2:6, align = "right", part = "all") %>%
+  theme_booktabs() %>%
+  autofit()
+```
+
+
+## Fig 5 — NMDS contour plot
+
+```{r MDS_GAM}
+## ── Species labels for NMDS ───────────────────────────────────────────────────
+## Build family-level labels prioritised by total abundance (same as Arctic).
+## taxa_file is dat_all_filt_combine_prim, set in multivar_plot_ggplot above.
+
+cc_pct <- dat_all_filt_combine_prim %>%
+  ungroup() %>%
+  select(sample_id, lineage, percent_reads) %>%
+  pivot_wider(names_from = lineage, values_from = percent_reads, values_fill = 0) %>%
+  column_to_rownames("sample_id")
+
+## align to env_mva order
+cc_pct <- cc_pct[as.character(env_mva$sample_id), colnames(comm_pct)]
+
+cc_name <- data.frame(lineage = colnames(cc_pct))
+
+y_labels_mds <- taxa_file %>%
+  ungroup() %>%
+  select(lineage:Species) %>%
+  distinct(lineage, .keep_all = TRUE) %>%
+  mutate(
+    lineage_stat = gsub(";", ".", lineage),
+    lineage_stat = gsub(" ",  ".", lineage_stat),
+    lineage_stat = gsub("-",  ".", lineage_stat)
+  ) %>%
+  inner_join(cc_name, by = "lineage") %>%
+  unite(y_labels, Phylum:Genus, sep = ";", remove = FALSE) %>%
+  mutate(y_labels        = gsub("NA", "Unclassified", y_labels),
+         Family_label    = if_else(is.na(Family) | Family == "NA", "", Family),
+         priority_abund  = colSums(cc_pct),
+         priority_abund  = if_else(is.na(Family) | Family == "NA", 0, priority_abund))
+
+## ── N→S sample rank for site labels (1 = northernmost) ───────────────────────
+site_ranks <- dat_all_filt_combine_prim %>%
+  distinct(sample_id, lat) %>%
+  arrange(desc(lat)) %>%
+  mutate(lat_rank = row_number())
+
+env_mva_plot <- env_mva %>%
+  left_join(site_ranks, by = "sample_id")
+
+## ── Plot settings ─────────────────────────────────────────────────────────────
+xlim_c   <- c(-2, 1.5)
+ylim_c   <- c(-1, 1)
+cex_let  <- 1.2
+cex_size <- 0.9
+
+## Letters positioned from par("usr") after each panel opens — always top-left.
+add_letter <- function(ltr) {
+  usr <- par("usr")
+  text(usr[1] + 0.03 * diff(usr[1:2]),
+       usr[4] - 0.07 * diff(usr[3:4]),
+       ltr, cex = cex_let)
+}
+
+## Site colours by habitat (env_mva row order matches nmds_res)
+hab_pt_cols <- hab_cols[as.character(env_mva$habitat)]
+
+## ── Base R 2 × 2 figure: 2 baseline panels + 2 significant env variables ──────
+## Non-significant ordisurf variables omitted (flat contours, shown in Table 2).
+tiff(paste0(dir, plot_file, "/RS_surface_mds_GAMs.tiff"),
+     width = 10, height = 10, units = "in", res = 300)
+
+par(mfrow = c(2, 2), mar = c(1.5, 1.5, 1.5, 1.5), oma = c(3, 3, 2, 2),
+    cex.axis = 1.1)
+
+## (a) sites labelled by latitude rank, coloured by habitat
+pl <- ordiplot(nmds_res, type = "n", xlim = xlim_c, ylim = ylim_c)
+orditorp(nmds_res, display = "sites", cex = 1.1, air = 0.01,
+         labels = as.character(env_mva_plot$lat_rank), col = hab_pt_cols)
+legend("topright", legend = names(hab_cols), fill = hab_cols,
+       bty = "n", cex = 0.9, border = NA)
+add_letter("a")
+
+## (b) species family labels
+ordiplot(nmds_res, type = "n", xlim = xlim_c, ylim = ylim_c)
+points(pl, "sites", pch = 16, col = hab_pt_cols, cex = 1.0)
+orditorp(nmds_res, display = "species", col = "grey30", air = 0.9,
+         priority = y_labels_mds$priority_abund,
+         labels   = y_labels_mds$Family_label,
+         cex = 1.0, pcex = 0)
+add_letter("b")
+
+## (c–d) ordisurf contours — significant variables only (SST mean, salinity)
+## Variable names omitted from plot top; identified by panel letter + caption.
+panel_vars <- list(
+  c = list(vals = env_mva$sst_mean, label = "SST mean"),
+  d = list(vals = env_mva$salinity, label = "Salinity")
+)
+
+for (ltr in names(panel_vars)) {
+  pv <- panel_vars[[ltr]]
+  pl <- ordiplot(nmds_res, type = "n", xlim = xlim_c, ylim = ylim_c)
+  points(pl, "sites", pch = 16, col = hab_pt_cols, cex = 1.0)
+  ordisurf(nmds_res, pv$vals, main = "", col = "black",
+           cex = 1, labcex = cex_size, add = TRUE)
+  add_letter(ltr)
+}
+
+mtext("NMDS1", side = 1, line = 1.1, at = 0.47, las = 1, adj = 0,
+      cex = 1, col = "black", outer = TRUE)
+mtext("NMDS2", side = 2, line = 0.7, at = 0.47, las = 0, adj = 0,
+      cex = 1, col = "black", outer = TRUE)
+
+dev.off()
+
+cat("NMDS stress:", round(nmds_res$stress, 3), "\n")
+```
+
+
+## Build L, R, Q matrices
+
+```{r fc_matrices}
+## ---- 1. Build the L matrix (sites × species, percent_reads) ----------------
+L_long <- dat_all_filt_combine_prim %>%
+  ungroup() %>%
+  select(sample_id, lineage, percent_reads) %>%
+  group_by(sample_id, lineage) %>%
+  summarise(percent_reads = sum(percent_reads), .groups = "drop")
+
+L_wide <- L_long %>%
+  pivot_wider(names_from = lineage, values_from = percent_reads, values_fill = 0) %>%
+  column_to_rownames("sample_id")
+
+## ---- 2. Build the R matrix (sites × env variables) -------------------------
+## Matches manyglm predictors: 4 continuous env vars + habitat (categorical).
+## dudi.hillsmith() handles mixed continuous/factor variables.
+## fourthcorner uses D2 statistic for continuous R × Q pairs and
+## G statistic (chi-square-like) for categorical R (habitat) × Q pairs.
+env_vars <- c("sst_mean", "nitrate", "pp_range", "land_distance")
+
+env_sub <- env %>%
+  rename_all(tolower) %>%
+  filter(sample_id %in% rownames(L_wide)) %>%
+  arrange(match(sample_id, rownames(L_wide)))
+
+R_mat <- env_sub %>%
+  select(all_of(tolower(env_vars))) %>%
+  mutate(across(everything(), ~as.numeric(scale(.)))) %>%
+  as.data.frame()
+rownames(R_mat) <- env_sub$sample_id
+
+## Add habitat as categorical variable
+hab_lookup   <- dat_all_filt_combine_prim %>% distinct(sample_id, habitat)
+R_mat$habitat <- factor(
+  hab_lookup$habitat[match(rownames(R_mat), hab_lookup$sample_id)]
+)
+
+L_wide <- L_wide[rownames(R_mat), ]
+
+## ---- 3. Build the Q matrix (species × traits) ------------------------------
+## Lineage prefix mismatch: L_wide uses "Eukaryota;..." but trait_dat starts at
+## kingdom — strip prefix for matching, restore afterwards (same as tiding join).
+lwide_stripped <- sub("^[^;]+;", "", colnames(L_wide))
+
+## trait_dat is pre-cleaned (zone renamed from zone...16, recoding applied)
+Q_mat <- trait_dat %>%
+  distinct(lineage, .keep_all = TRUE) %>%
+  filter(lineage %in% lwide_stripped) %>%
+  select(lineage, zone, trophic.level, as_catagory,
+         planktonic.larval.form, mobility) %>%
+  column_to_rownames("lineage") %>%
+  mutate(across(where(is.character), as.factor)) %>%
+  as.data.frame()
+
+## Align species: intersect on stripped names, restore full-prefix rownames.
+shared_stripped <- intersect(lwide_stripped, rownames(Q_mat))
+keep_cols       <- colnames(L_wide)[lwide_stripped %in% shared_stripped]
+L_wide          <- L_wide[, keep_cols, drop = FALSE]
+rownames(Q_mat) <- keep_cols[match(rownames(Q_mat),
+                                   sub("^[^;]+;", "", keep_cols))]
+Q_mat           <- Q_mat[colnames(L_wide), , drop = FALSE]
+
+## Drop species with any remaining NA trait values and re-align L_wide.
+complete_sp <- rownames(Q_mat)[complete.cases(Q_mat)]
+Q_mat  <- Q_mat[complete_sp, , drop = FALSE]
+L_wide <- L_wide[, complete_sp, drop = FALSE]
+cat("Species retained after NA filter:", nrow(Q_mat), "\n")
+```
+
+
+## Trait diagnostics
+Run after `fc_matrices` to verify category counts before the permutation test.
+```{r trait_diagnostics}
+## ── 1. Species counts at each filtering step ──────────────────────────────────
+n_total_sp <- length(lwide_stripped)
+n_matched  <- length(shared_stripped)
+n_complete <- nrow(Q_mat)
+
+step_df <- data.frame(
+  Step = c("Species in community (L_wide)",
+           "Matched to trait file",
+           "  Not matched (absent from trait file)",
+           "Retained — complete trait data",
+           "  Dropped — ≥ 1 trait value missing"),
+  N    = c(n_total_sp, n_matched, n_total_sp - n_matched,
+           n_complete,  n_matched  - n_complete)
+)
+kable(step_df, col.names = c("Step", "N species"), format = "html",
+      caption = "Species retained at each filtering step for fourth-corner / RLQ") %>%
+  kable_styling(full_width = FALSE)
+
+## ── 2. Community read coverage ────────────────────────────────────────────────
+reads_total    <- sum(L_long$percent_reads[
+                    L_long$sample_id %in% rownames(L_wide)])
+reads_retained <- sum(L_wide)
+cat(sprintf(
+  "\nRead coverage: retained species account for %.1f%% of reads in analysed samples.\n\n",
+  100 * reads_retained / reads_total
+))
+
+## ── 3. Missing data by trait (among matched species, before NA filter) ─────────
+Q_all_matched <- trait_dat %>%
+  distinct(lineage, .keep_all = TRUE) %>%
+  filter(lineage %in% shared_stripped) %>%
+  select(zone, trophic.level, as_catagory,
+         planktonic.larval.form, mobility)
+
+miss_df <- data.frame(
+  Trait       = colnames(Q_all_matched),
+  Present     = sapply(Q_all_matched, function(x) sum(!is.na(x))),
+  Missing     = sapply(Q_all_matched, function(x) sum( is.na(x))),
+  Pct_missing = round(100 * sapply(Q_all_matched, function(x) mean(is.na(x))), 1)
+)
+kable(miss_df, row.names = FALSE, format = "html",
+      col.names = c("Trait", "Present", "Missing", "% missing"),
+      caption = paste("Missing trait data among", n_matched,
+                      "species matched to trait file")) %>%
+  kable_styling(full_width = FALSE)
+
+## ── 4. Category counts per trait in Q_mat (species used in analysis) ──────────
+count_list <- lapply(colnames(Q_mat), function(tr) {
+  col <- Q_mat[[tr]]
+  if (is.factor(col)) {
+    tbl <- sort(table(col), decreasing = TRUE)
+    data.frame(Trait    = tr,
+               Category = names(tbl),
+               N        = as.integer(tbl),
+               Flag     = ifelse(as.integer(tbl) < 5, "< 5 — consider merging", ""),
+               stringsAsFactors = FALSE)
+  } else {
+    data.frame(Trait    = tr,
+               Category = sprintf("continuous  [%.2f – %.2f]",
+                                  min(col, na.rm = TRUE), max(col, na.rm = TRUE)),
+               N        = sum(!is.na(col)),
+               Flag     = "",
+               stringsAsFactors = FALSE)
+  }
+})
+count_df <- bind_rows(count_list)
+kable(count_df, row.names = FALSE, format = "html",
+      col.names = c("Trait", "Category", "N species", "Flag"),
+      caption = paste("Trait category counts in Q_mat (", nrow(Q_mat),
+                      "species). Yellow = < 5 species; consider merging.")) %>%
+  kable_styling(full_width = FALSE) %>%
+  row_spec(which(count_df$Flag != ""), background = "#fff3cd")
+
+## ── 5. Cross-tabulations of all factor trait pairs ────────────────────────────
+cat("\n=== Cross-tabulations of factor trait pairs (flag cells < 3 species) ===\n\n")
+factor_traits <- names(which(sapply(Q_mat, is.factor)))
+if (length(factor_traits) >= 2) {
+  for (pair in combn(factor_traits, 2, simplify = FALSE)) {
+    ct <- table(Q_mat[[pair[1]]], Q_mat[[pair[2]]], dnn = pair)
+    cat(pair[1], "×", pair[2], ":\n")
+    print(ct)
+    if (any(ct > 0 & ct < 3))
+      cat("  *** cells with 1–2 species — consider merging levels ***\n")
+    cat("\n")
+  }
+}
+```
+
+
+## Fourth corner fit
+Fourth-corner test (Dray & Legendre 2008, Ecology 89:3400–3412). `modeltype=6`
+combined permutation test; `p.adjust.method="none"` correct — the combined
+permutation IS the multiple-testing correction. Display threshold α = 0.2.
+Run this chunk before `rlq_biplot` and `fourth_corner_plot`.
+
+```{r fc_fit}
+fc_res <- fourthcorner(
+  tabR               = R_mat,
+  tabL               = L_wide,
+  tabQ               = Q_mat,
+  modeltype          = 6,
+  p.adjust.method.D  = "none",
+  p.adjust.method.G  = "none",
+  nrepet             = 9999
+)
+print(fc_res)
+
+nR <- length(fc_res$colnames.R)   # includes expanded habitat levels
+nQ <- length(fc_res$colnames.Q)
+
+## D2 and D statistics (for continuous R rows)
+d2_mat   <- matrix(fc_res$tabD2$obs,    nrow = nR, ncol = nQ,
+                   dimnames = list(fc_res$colnames.R, fc_res$colnames.Q))
+d_mat    <- matrix(fc_res$tabD$obs,     nrow = nR, ncol = nQ,
+                   dimnames = list(fc_res$colnames.R, fc_res$colnames.Q))
+
+## G statistic (for categorical R rows — habitat levels)
+g_mat    <- matrix(fc_res$tabG$obs,    nrow = nR, ncol = nQ,
+                   dimnames = list(fc_res$colnames.R, fc_res$colnames.Q))
+
+## Combined p-value matrix: D2 p-values for continuous rows, G p-values for habitat rows.
+## fc_res$assignR maps each expanded colnames.R entry to its original variable (1-indexed).
+## fc_res$indexR gives the type (1 = continuous, 2 = categorical) per original variable.
+row_type  <- fc_res$indexR[fc_res$assignR]   # type per expanded R row
+pval_d2   <- matrix(fc_res$tabD2$pvalue, nrow = nR, ncol = nQ,
+                    dimnames = list(fc_res$colnames.R, fc_res$colnames.Q))
+pval_g    <- matrix(fc_res$tabG$pvalue,  nrow = nR, ncol = nQ,
+                    dimnames = list(fc_res$colnames.R, fc_res$colnames.Q))
+pval_mat  <- pval_d2
+pval_mat[row_type == 2, ] <- pval_g[row_type == 2, ]   # habitat rows use G p-values
+
+cat("R variable types (1=continuous, 2=categorical):\n")
+print(data.frame(var = fc_res$colnames.R, type = row_type))
+cat("Row sums d2_mat:", paste(round(rowSums(d2_mat), 3), collapse = ", "), "\n")
+```
+
+
+## RLQ biplot and habitat ordination
+RLQ site scores coloured by habitat with 75% data ellipses (`type = "norm"`
+= data ellipse unaffected by sample size, unlike CI ellipses which inflate
+with small n). Trait arrows filtered to fourth-corner significant levels
+(p ≤ 0.2 from fc_fit); all env variable arrows retained (only 4 total).
+
+```{r rlq_biplot}
+## ---- RLQ ordination ---------------------------------------------------------
+afcL    <- dudi.coa(L_wide, scannf = FALSE, nf = 2)
+acpR    <- dudi.hillsmith(R_mat, row.w = afcL$lw, scannf = FALSE, nf = 2)
+acpQ    <- dudi.hillsmith(Q_mat, row.w = afcL$cw, scannf = FALSE, nf = 2)
+rlq_res <- rlq(acpR, afcL, acpQ, scannf = FALSE, nf = 2)
+summary(rlq_res)
+
+tiff(paste0(dir, plot_file, "/RLQ_biplot_baseR.tiff"),
+     width = 18, height = 15, units = "cm", res = 300)
+plot(rlq_res)
+dev.off()
+
+## ---- Extract RLQ scores -----------------------------------------------------
+rlq_sites <- as.data.frame(rlq_res$lR) %>%
+  rownames_to_column("sample_id") %>%
+  rename(RLQ1 = 2, RLQ2 = 3) %>%
+  left_join(distinct(plot_dat_phylum, sample_id, habitat), by = "sample_id") %>%
+  mutate(habitat = factor(habitat, levels = names(hab_cols)))
+
+rlq_env <- as.data.frame(rlq_res$l1) %>%
+  rownames_to_column("var") %>%
+  rename(RLQ1 = 2, RLQ2 = 3)
+
+rlq_traits_all <- as.data.frame(rlq_res$c1) %>%
+  rownames_to_column("trait") %>%
+  rename(RLQ1 = 2, RLQ2 = 3)
+
+## ---- Filter trait arrows to fourth-corner significant levels ----------------
+## sig_fc_levels: trait levels where min p across env vars ≤ 0.2
+sig_fc_levels <- fc_res$colnames.Q[apply(pval_mat, 2, min) <= 0.2]
+
+rlq_traits_sig <- rlq_traits_all %>%
+  filter(trait %in% sig_fc_levels) %>%
+  mutate(label = sub("^[^.]+\\.", "", trait))  # strip trait-name prefix
+
+## ---- Arrow scaling ----------------------------------------------------------
+## Stretch arrows to ~75% of the site cloud radius
+site_radius <- max(sqrt(rlq_sites$RLQ1^2 + rlq_sites$RLQ2^2), na.rm = TRUE)
+env_radius  <- max(sqrt(rlq_env$RLQ1^2   + rlq_env$RLQ2^2),   na.rm = TRUE)
+arr_mul     <- 0.75 * site_radius / env_radius
+
+env_lbl_arr <- c(sst_mean      = "SST mean",
+                 nitrate       = "Nitrate",
+                 pp_range      = "PP range",
+                 land_distance = "Dist. shore")
+
+rlq_env_plot <- rlq_env %>%
+  mutate(xend  = RLQ1 * arr_mul,  yend  = RLQ2 * arr_mul,
+         lbl_x = RLQ1 * arr_mul * 1.18, lbl_y = RLQ2 * arr_mul * 1.18,
+         label = unname(env_lbl_arr[var]))
+
+## Scale trait arrows by the same factor
+rlq_traits_plot <- rlq_traits_sig %>%
+  mutate(xend  = RLQ1 * arr_mul,  yend  = RLQ2 * arr_mul,
+         lbl_x = RLQ1 * arr_mul * 1.18, lbl_y = RLQ2 * arr_mul * 1.18)
+
+## ---- Plot -------------------------------------------------------------------
+## type = "norm" = data ellipse (spread of points, unaffected by n).
+## level = 0.75 keeps ellipses compact; raise/lower to taste.
+fig_rlq <- ggplot(rlq_sites, aes(RLQ1, RLQ2)) +
+  stat_ellipse(aes(fill = habitat, colour = habitat),
+               type = "norm", level = 0.75, geom = "polygon",
+               alpha = 0.12, linewidth = 1.1, linetype = "solid") +
+  geom_point(aes(colour = habitat, shape = habitat),
+             size = 2.2, alpha = 0.9) +
+  scale_fill_manual(values   = hab_cols, name = "Habitat") +
+  scale_colour_manual(values = hab_cols, name = "Habitat") +
+  scale_shape_manual(values  = c(16, 17, 15), name = "Habitat") +
+  ## Env arrows (blue)
+  geom_segment(data = rlq_env_plot,
+               aes(x = 0, y = 0, xend = xend, yend = yend),
+               arrow = arrow(length = unit(0.18, "cm"), type = "closed"),
+               colour = "#2166AC", linewidth = 0.9, inherit.aes = FALSE) +
+  geom_text(data = rlq_env_plot,
+            aes(x = lbl_x, y = lbl_y, label = label),
+            colour = "#2166AC", size = 3.0, inherit.aes = FALSE) +
+  ## Trait arrows — fourth-corner significant only (red dashed)
+  geom_segment(data = rlq_traits_plot,
+               aes(x = 0, y = 0, xend = xend, yend = yend),
+               arrow = arrow(length = unit(0.18, "cm"), type = "closed"),
+               colour = "#C0392B", linewidth = 0.7, linetype = "dashed",
+               inherit.aes = FALSE) +
+  geom_text(data = rlq_traits_plot,
+            aes(x = lbl_x, y = lbl_y, label = label),
+            colour = "#C0392B", size = 2.8, inherit.aes = FALSE) +
+  geom_hline(yintercept = 0, linetype = "dotted", colour = "grey60") +
+  geom_vline(xintercept = 0, linetype = "dotted", colour = "grey60") +
+  theme_bw(base_size = 10) +
+  theme(panel.border    = element_rect(colour = "black", fill = NA, linewidth = 0.8),
+        legend.position = "right") +
+  labs(x = "RLQ axis 1", y = "RLQ axis 2")
+
+fig_rlq
+
+ggsave(paste0(dir, plot_file, "/Fig_RLQ_biplot.tiff"),
+       fig_rlq, width = 18, height = 14, units = "cm", dpi = 300)
+```
+
+
+## Fourth corner plot
+Tile + dot plot: env variables on x-axis, trait categories on y-axis grouped
+into trait facets. Tile shading = significance (α = 0.2); dot colour =
+direction (D stat, Zissou1 blue→red); dot size = strength (√D²).
+
+```{r fourth_corner_plot}
+## Axis labels: continuous env vars + habitat levels (expanded from factor)
+## fc_res$colnames.R now includes "habitat.Coral", "habitat.Mangrove", etc.
+env_lbl_cont <- c(sst_mean      = "SST (mean)",
+                  nitrate       = "Nitrate",
+                  pp_range      = "Prim. prod. (range)",
+                  land_distance = "Dist. to shore")
+
+## Build label for every expanded R variable:
+## continuous vars get their nice name; habitat levels strip the "habitat." prefix
+env_row_lbl <- setNames(
+  ifelse(fc_res$colnames.R %in% names(env_lbl_cont),
+         unname(env_lbl_cont[fc_res$colnames.R]),
+         sub("^[^.]+\\.", "", fc_res$colnames.R)),
+  fc_res$colnames.R
+)
+
+clean_level     <- sub("^[^.]+\\.", "", fc_res$colnames.Q)
+trait_group     <- fc_res$varnames.Q[fc_res$assignQ]
+trait_group_lbl <- c(zone                   = "Zone",
+                     trophic.level          = "Trophic level",
+                     as_catagory            = "Body size",
+                     planktonic.larval.form = "Planktonic larval",
+                     mobility               = "Mobility")
+
+to_long_fc <- function(mat, val) {
+  as.data.frame(mat) %>%
+    rownames_to_column("env") %>%
+    pivot_longer(-env, names_to = "trait_level", values_to = val)
+}
+
+## row_type_long: 1 = continuous, 2 = categorical (habitat); drives dot display.
+row_type_vec <- setNames(row_type, fc_res$colnames.R)
+
+fc_long <- to_long_fc(d2_mat, "D2") %>%
+  left_join(to_long_fc(pval_mat, "p_value"), by = c("env", "trait_level")) %>%
+  left_join(to_long_fc(d_mat,   "D_stat"),  by = c("env", "trait_level")) %>%
+  left_join(to_long_fc(g_mat,   "G_stat"),  by = c("env", "trait_level")) %>%
+  mutate(
+    r_type      = unname(row_type_vec[env]),
+    sig_tile    = if_else(p_value <= 0.2, "significant", "not significant"),
+    ## Dot size: √D2 for continuous rows, √G for habitat rows
+    dot_size    = if_else(r_type == 1, sqrt(pmax(D2, 0)), sqrt(pmax(G_stat, 0))),
+    D_stat_plot = D2,      ## tabD2 is signed (-0.15 to +18.6); tabD is unsigned magnitude
+    env_label   = unname(env_row_lbl[env]),
+    level_clean = clean_level[match(trait_level, fc_res$colnames.Q)],
+    trait_grp   = trait_group[match(trait_level, fc_res$colnames.Q)],
+    trait_grp_f = factor(unname(trait_group_lbl[trait_grp]),
+                         levels = unname(trait_group_lbl[fc_res$varnames.Q])),
+    ## Habitat columns first (matching manyglm order), then continuous env vars
+    env_f       = factor(env_label,
+                         levels = unname(env_row_lbl[c(
+                           names(row_type_vec)[row_type_vec == 2],
+                           names(row_type_vec)[row_type_vec == 1]
+                         )])),
+    level_f     = factor(level_clean, levels = unique(clean_level))
+  )
+
+col_sig <- c("not significant" = "grey85", "significant" = "grey40")
+
+## Symmetric limits force the legend to span full blue→red even though all
+## observed D values are positive (data appears yellow→red in the plot).
+## This matches Fig 4's palette and makes clear negative relationships are possible.
+max_d <- max(abs(fc_long$D_stat_plot), na.rm = TRUE)
+
+fc_gg <- ggplot(fc_long, aes(env_f, level_f)) +
+  facet_grid(trait_grp_f ~ ., scales = "free_y", space = "free_y", switch = "y") +
+  geom_tile(aes(fill = sig_tile), colour = "grey50",
+            width = 0.92, height = 0.92) +
+  scale_fill_manual(values = col_sig, name = NULL) +
+  ## All rows (continuous + habitat): colour = D stat, size = strength
+  geom_point(aes(colour = D_stat_plot, size = dot_size)) +
+  scale_colour_gradient2(
+    name     = "Direction\n(D stat)",
+    low      = pal3[1], mid = pal3[2], high = pal3[3],
+    midpoint = 0,
+    limits   = c(-max_d, max_d)
+  ) +
+  scale_size_continuous(name = "Strength", range = c(1, 7)) +
+  theme_minimal() +
+  theme(
+    strip.text.y.left = element_text(size = 9, face = "bold", angle = 0),
+    strip.placement   = "outside",
+    axis.text.x       = element_text(angle = 45, hjust = 1, vjust = 1, size = 10),
+    axis.text.y       = element_text(size = 9),
+    axis.ticks        = element_blank(),
+    panel.grid        = element_blank(),
+    legend.position   = "right"
+  ) +
+  labs(x = NULL, y = NULL)
+
+fc_gg
+
+ggsave(paste0(dir, plot_file, "/Fig6_fourth_corner.tiff"),
+       fc_gg, width = 16, height = 20, units = "cm", dpi = 300)
+```
+
+
+
+
+## Distance decay
+Bray-Curtis dissimilarity vs. through-water geographic distance (km).
+
+Run `through_water_dist` once to download bathymetry and compute the distance
+matrix, then set that chunk to `eval=FALSE` for subsequent knits.
+
+```{r through_water_dist, eval=FALSE}
+## Downloads NOAA ETOPO1 bathymetry for the Red Sea and computes pairwise
+## through-water distances between all sample sites. Land cells act as barriers
+## so distances are routed through ocean only (unlike Haversine straight-line).
+## Saves through_water_dist_km.csv; re-run only if sample locations change.
+library(marmap)
+library(terra)
+
+## All sample locations before otu filtering
+pts_all <- dat_all_filt_combine_prim %>%
+  filter(type == "sample") %>%
+  distinct(sample_id, lon, lat)
+
+## Download ETOPO1 at 1-arc-minute resolution (~1.85 km); cached as .csv in dir
+bat <- marmap::getNOAA.bathy(
+  lon1 = 31, lon2 = 45, lat1 = 11, lat2 = 31,
+  resolution = 1,
+  keep = TRUE,
+  path = dir
+)
+
+## Convert to terra SpatRaster (marmap → raster → terra)
+bat_rast <- terra::rast(marmap::as.raster(bat))
+
+## Water mask: ocean (depth < 0) = 1; land (depth ≥ 0) = NA (barrier)
+water_rast <- bat_rast
+water_rast[bat_rast >= 0] <- NA
+water_rast[!is.na(water_rast)] <- 1
+
+## Dilate water mask by 1 cell (~1.85 km) so coastal sample points that fall
+## just inside the land boundary of the raster are treated as water.
+water_rast <- terra::focal(water_rast, w = 3, fun = "max", na.rm = TRUE,
+                           na.policy = "omit")
+water_rast[!is.na(water_rast)] <- 1
+
+## SpatVector of sample points for extraction
+pts_vect <- terra::vect(pts_all, geom = c("lon", "lat"), crs = "EPSG:4326")
+n <- nrow(pts_all)
+
+## Build symmetric distance matrix; gridDist routes through water only
+tw_mat <- matrix(NA_real_, n, n,
+                 dimnames = list(pts_all$sample_id, pts_all$sample_id))
+diag(tw_mat) <- 0
+
+for (i in seq_len(n)) {
+  tmp  <- water_rast
+  cell <- terra::cellFromXY(tmp, cbind(pts_all$lon[i], pts_all$lat[i]))
+  tmp[cell] <- 2                        # mark focal site as target
+  d <- terra::gridDist(tmp, target = 2) / 1000   # metres → km
+  tw_mat[i, ] <- terra::extract(d, pts_vect)[, 2]
+}
+
+write.csv(tw_mat, paste0(dir, "through_water_dist_km.csv"), row.names = TRUE)
+cat("Saved:", n, "×", n, "through-water distance matrix\n")
+```
+
+```{r dist_decay}
+## ---- helper: dist object → data frame --------------------------------------
+dist2df <- function(inDist) {
+  A <- attr(inDist, "Size")
+  B <- if (is.null(attr(inDist, "Labels"))) sequence(A) else attr(inDist, "Labels")
+  if (isTRUE(attr(inDist, "Diag")))  attr(inDist, "Diag")  <- FALSE
+  if (isTRUE(attr(inDist, "Upper"))) attr(inDist, "Upper") <- FALSE
+  data.frame(
+    row   = B[unlist(lapply(sequence(A)[-1], function(x) x:A))],
+    col   = rep(B[-length(B)], (length(B) - 1):1),
+    value = as.vector(inDist)
+  )
+}
+
+## ---- OTU-style wide table (samples × taxa) ----------------------------------
+min_samp_occur <- 2   # drop taxa present in fewer than this many samples
+otu_wide <- dat_all_filt_combine_prim %>%
+  filter(type == "sample") %>%
+  select(sample_id, lineage, percent_reads) %>%
+  group_by(sample_id, lineage) %>%
+  summarise(percent_reads = sum(percent_reads), .groups = "drop") %>%
+  pivot_wider(names_from = lineage, values_from = percent_reads, values_fill = 0) %>%
+  column_to_rownames("sample_id")
+
+cc       <- apply(otu_wide, 2, function(x) sum(x > 0))
+otu_wide <- otu_wide[, cc >= min_samp_occur]
+
+## ---- sample metadata (including habitat) ------------------------------------
+sdat_dd <- dat_all_filt_combine_prim %>%
+  filter(type == "sample") %>%
+  distinct(sample_id, lat, lon, habitat) %>%
+  filter(sample_id %in% rownames(otu_wide)) %>%
+  arrange(match(sample_id, rownames(otu_wide)))
+
+## ---- Through-water distance (km) -------------------------------------------
+## Load pre-computed matrix (run through_water_dist chunk once first)
+tw_mat   <- as.matrix(read.csv(paste0(dir, "through_water_dist_km.csv"),
+                               row.names = 1, check.names = FALSE))
+tw_mat   <- tw_mat[sdat_dd$sample_id, sdat_dd$sample_id]
+geo_dist <- as.dist(tw_mat)
+attr(geo_dist, "Labels") <- sdat_dd$sample_id
+
+## ---- Bray-Curtis dissimilarity ----------------------------------------------
+vg <- vegdist(otu_wide, method = "bray", binary = FALSE)
+
+## ---- Build pairwise data frame with habitat labels --------------------------
+pairs_df <- dist2df(geo_dist) %>%
+  rename(sample1 = row, sample2 = col, km = value) %>%
+  left_join(select(sdat_dd, sample_id, habitat), by = c("sample1" = "sample_id")) %>%
+  rename(hab1 = habitat) %>%
+  left_join(select(sdat_dd, sample_id, habitat), by = c("sample2" = "sample_id")) %>%
+  rename(hab2 = habitat) %>%
+  mutate(bc        = as.vector(vg),
+         within_hab = if_else(hab1 == hab2, hab1, NA_character_),
+         hab_pair   = if_else(hab1 == hab2, hab1, "Between habitats"))
+
+## ---- Compute loess fits per habitat with 95% CI ----------------------------
+loess_fits <- pairs_df %>%
+  filter(!is.na(within_hab), is.finite(km)) %>%
+  group_by(within_hab) %>%
+  group_modify(~{
+    fit    <- loess(bc ~ km, data = .x, span = 0.75)
+    km_seq <- seq(min(.x$km), max(.x$km), length.out = 300)
+    pred   <- predict(fit, newdata = data.frame(km = km_seq), se = TRUE)
+    data.frame(km  = km_seq,
+               fit = pred$fit,
+               lwr = pred$fit - 1.96 * pred$se.fit,
+               upr = pred$fit + 1.96 * pred$se.fit)
+  }) %>%
+  ungroup() %>%
+  mutate(within_hab = factor(within_hab, levels = c("Coral", "Mangrove", "Seagrass"))) %>%
+  arrange(within_hab)
+
+## ---- Distance-decay plot by habitat -----------------------------------------
+p_dd <- ggplot() +
+  geom_point(data = filter(pairs_df, !is.na(within_hab), is.finite(km)),
+             aes(km, bc, colour = within_hab), alpha = 0.3, size = 0.8) +
+  ## Transparent coloured CI ribbon
+  geom_ribbon(data = loess_fits,
+              aes(x = km, ymin = lwr, ymax = upr, fill = within_hab),
+              alpha = 0.22) +
+  ## Thin lines on ribbon edges
+  geom_line(data = loess_fits,
+            aes(x = km, y = lwr, colour = within_hab),
+            linewidth = 0.25) +
+  geom_line(data = loess_fits,
+            aes(x = km, y = upr, colour = within_hab),
+            linewidth = 0.25) +
+  ## Solid loess line
+  geom_line(data = loess_fits,
+            aes(x = km, y = fit, colour = within_hab),
+            linewidth = 1.2) +
+  scale_colour_manual(values = hab_cols, name = "Habitat") +
+  scale_fill_manual(values  = hab_cols, name = "Habitat") +
+  labs(x = "Through-water distance (km)",
+       y = "Bray-Curtis dissimilarity") +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "right")
+
+p_dd
+
+ggsave(paste0(dir, plot_file, "/Fig7_dist_decay.tiff"),
+       p_dd, width = 14, height = 10, units = "cm", dpi = 300)
+```
+
+## Mantel correlogram — diagnostic only, not a manuscript figure
+```{r mantel_diag, eval=FALSE}
+mantel_corr <- mantel.correlog(vg, D.geo = geo_dist,
+  n.class = 0, cutoff = TRUE, r.type = "pearson",
+  nperm = 999, mult = "holm", progressive = TRUE)
+plot(mantel_corr)
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+## Session info
+Records R version and exact package versions used — important for reproducibility.
+```{r session_info}
+sessionInfo()
+```

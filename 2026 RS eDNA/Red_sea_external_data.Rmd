@@ -1,0 +1,555 @@
+---
+title: "Red Sea surface - external data (env covariates + species traits)"
+author: "Nathan R. Geraldi"
+date: "2026 update"
+output: github_document
+---
+
+Merged from: Red_sea_extract_envir_data.Rmd + Red_sea_get_taxa_traits.Rmd
+Run once (or when new data are needed). Both sections export CSVs used by
+Red_sea_analysis_plots_euk.Rmd.
+
+set table options
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## renv — package version locking
+To lock exact package versions for reproducibility, run once from the R console
+after all packages are installed and working:
+```r
+# renv::init()     # first time: initialise and snapshot
+# renv::snapshot() # after adding/updating packages
+# renv::restore()  # collaborators run this to install exact same versions
+```
+Do NOT run renv::init() mid-analysis — do it when the project is stable and
+ready for GitHub. The renv.lock file should be committed to the repository.
+
+## libraries
+```{r libraries, message=FALSE, warning=FALSE}
+library(fields)
+library(psych)
+library(tidyverse)
+library(here)        # robust paths relative to .Rproj root
+
+# environmental raster extraction
+library(ncdf4)
+library(terra)       # replaces retired raster package
+library(sf)          # replaces retired rgeos and rgdal packages
+library(stringr)
+library(mregions2)
+
+# species traits from WoRMS
+library(worrms)      # devtools::install_github("ropensci/worrms")
+library(qdapRegex)
+library(openxlsx)
+
+# NOTE: rgeos and rgdal were retired from CRAN in Oct 2023.
+# All spatial operations now use sf + terra.
+```
+
+## functions
+```{r functions, message=FALSE, warning=FALSE}
+delete.na <- function(DF, n = 0) {
+  DF[rowSums(is.na(DF)) <= n, ]
+}
+
+# For each point (lon, lat), return the value of the nearest non-NA raster cell.
+# Used for coastal points that fall in NA cells under direct extraction.
+nearest_non_na <- function(rast_layer, lon, lat) {
+  all_vals <- terra::values(rast_layer)[, 1]
+  all_xy   <- terra::xyFromCell(rast_layer, seq_len(terra::ncell(rast_layer)))
+  as.numeric(apply(cbind(lon, lat), 1, function(p) {
+    dists          <- sqrt((all_xy[, 1] - p[1])^2 + (all_xy[, 2] - p[2])^2)
+    dists[is.na(all_vals)] <- NA
+    all_vals[which.min(dists)]
+  }))
+}
+```
+
+
+## define universal variables
+```{r define_universal}
+stud_pat <- "RS_surface"
+
+## All inputs, outputs, and plots live in the '2026 RS eDNA' folder.
+dir              <- paste0(here::here("2026 RS eDNA"), "/")
+export_file      <- ""    # CSV exports → dir
+out_file         <- ""    # summary outputs → dir
+plot_file        <- "plots"  # plots subfolder: dir/plots/
+
+# filtered sequence data (output of post-DADA2 Rmd)
+dat_name <- paste0(stud_pat, "_filtered_data_all.csv")
+
+# sample metadata Excel
+sam_file_path <- paste0(dir, "RS_surface_sample_data_all.xlsx")
+
+# Path to large raster/geo layers stored locally (not tracked in repo).
+# Used by land_dist and oracle chunks below.
+# See each chunk header for download instructions.
+geo_file <- "/Users/nathangeraldi/Dropbox/Global_databases"
+```
+
+
+## import data
+Sample and sequence data shared by both sections.
+```{r import}
+# sample metadata
+sheets     <- openxlsx::getSheetNames(sam_file_path)
+sam_dat    <- lapply(sheets, openxlsx::read.xlsx, xlsxFile = sam_file_path)
+names(sam_dat) <- sheets
+sample_dat <- sam_dat$sample_data
+
+# filtered sequence data (output of post-DADA2 Rmd)
+dat <- data.table::fread(file = paste0(dir, export_file, dat_name), sep = ",")
+```
+
+
+## geo column setup
+```{r def_var}
+# columns for spatial extraction (lon, lat order)
+data    <- sample_dat
+geo_col <- c(14, 13)   # column indices: Lon then Lat
+xy      <- data[, geo_col]
+```
+
+
+!###############################################################################
+# SECTION 1: Environmental covariates
+!###############################################################################
+
+## MSEC data
+Not used for this study — set eval=FALSE.
+Data source: https://shiny.sesync.org/apps/msec/
+Citation: Yeager et al. (2017) Ecology 98(5):1383. https://doi.org/10.1002/ecy.1884
+Download: supplement file ecy1884-sup-0002-DataS1 (NetCDF layers).
+```{r MSEC, eval=FALSE, include=FALSE}
+msec_path <- paste0(geo_file, "/MSEC/ecy1884-sup-0002-DataS1")
+files  <- list.files(msec_path, pattern = "*.nc")
+
+namess <- data.frame(files) %>%
+  rename(file_name = files) %>%
+  mutate(file_name = substr(as.character(file_name), 1, nchar(as.character(file_name)) - 3))
+
+ff <- c(1, 2, 3, 4, 5, 8, 9, 10, 12, 13, 14, 15)
+f  <- files[ff]
+cn <- namess$file_name[ff]
+
+data1 <- data
+for (i in seq_along(f)) {
+  nam <- cn[i]
+  x   <- terra::rast(paste0(msec_path, "/", f[i]))
+  x   <- terra::rotate(x)
+  data1$loopname <- terra::extract(x, cbind(data1[, geo_col[1]], data1[, geo_col[2]]))[, 2]
+  q   <- length(names(data1))
+  names(data1)[q] <- nam
+}
+```
+
+
+## land distance
+Distance to the nearest land surface, extracted from GMED (Global Marine Environment Datasets).
+Data source: https://gmed.auckland.ac.nz/download.html  (layer: Land Distance)
+Figshare archive: https://doi.org/10.6084/m9.figshare.5937268
+Citation: Basher Z, Bowden DA, Costello MJ (2018) Global Marine Environment Datasets (GMED).
+  Earth System Science Data. https://doi.org/10.5194/essd-2018-64
+File used: GMED/Land_distance/gb_land_distance.asc (5 arc-min resolution, ASC format).
+```{r land_dist}
+r <- terra::rast(paste0(geo_file, "/GMED/Land_distance/gb_land_distance.asc"))
+
+# direct extraction
+data$land_distance <- terra::extract(r, cbind(data$Lon, data$Lat))[, 2]
+
+# nearest non-NA extraction (avoids NAs for coastal points)
+data$land_distance_near <- nearest_non_na(r, data$Lon, data$Lat)
+```
+
+
+## Bio-Oracle surface data
+Surface present-day layers (2000–2014) at 5 arc-min (~9.2 km) resolution.
+Data source: https://www.bio-oracle.org  →  Download  →  Present-day  →  Surface
+Citation: Assis J, Tyberghein L, Bosch S, Verbruggen H, Serrão EA, De Clerck O (2018)
+  Bio-ORACLE v2.0: Extending marine data layers for bioclimatic modelling.
+  Global Ecology and Biogeography 27:277–284. https://doi.org/10.1111/geb.12693
+Also cite original: Tyberghein et al. (2012) Global Ecology and Biogeography 21:272–281.
+  https://doi.org/10.1111/j.1466-8238.2011.00656.x
+Variables extracted (ff indices 33,35,22,24,27,12,15 within Surface_present folder):
+  SST mean, SST range, chlorophyll-a mean, chlorophyll-a range, salinity mean,
+  nitrate mean, PAR mean. Download all Surface_present .asc files and place in
+  geo_file/Bio-oracle/Surface_present/. The ff index vector selects the seven
+  variables above — verify indices match your downloaded file list order.
+```{r oracle}
+rast_path <- paste0(geo_file, "/Bio-oracle/Surface_present")
+files     <- list.files(rast_path, pattern = "*.asc")
+
+namess <- data.frame(files) %>%
+  rename(file_name = files) %>%
+  mutate(file_name = gsub(".asc", "", as.character(file_name)))
+
+ff <- c(33, 35, 22, 24, 27, 12, 15)  # indices for SST mean/range, chla mean/range, salinity, nitrate, PAR
+f  <- files[ff]
+cn <- namess$file_name[ff]
+
+for (i in seq_along(f)) {
+  nam   <- cn[i]
+  nam_n <- paste0(cn[i], "_near")
+  x     <- terra::rast(paste0(rast_path, "/", f[i]))
+
+  # direct extraction
+  data$loopname <- terra::extract(x, cbind(data$Lon, data$Lat))[, 2]
+  q <- length(names(data)) - 1
+  names(data) <- c(names(data[, 1:q]), nam)
+
+  # nearest non-NA extraction
+  data$loopname <- nearest_non_na(x, data$Lon, data$Lat)
+  q <- length(names(data)) - 1
+  names(data) <- c(names(data[, 1:q]), nam_n)
+}
+```
+
+
+## export environmental data
+```{r export_env}
+data.table::fwrite(data,
+  paste0(dir, export_file, "Red_sea_eDNA_enviro_var.csv"),
+  sep = ",")
+```
+
+
+
+# SECTION 2: Species traits (WoRMS)
+
+
+## tidy species list
+
+```{r tidy_sp}
+tl <- c("Superkingdom", "Kingdom", "Phylum", "Class", "Order",
+        "Family", "Genus", "Species")
+
+taxa <- dat %>%
+  dplyr::rename(species_observed = species) %>%
+  filter(primer == "18smini" | primer == "euka02") %>%
+    ## strip cluster_num (last ;-delimited field) from lineage FIRST, before any
+  ## join or group_by — different primers assign different cluster numbers to the
+  ## same taxon, so leaving it in prevents correct primer combination later.
+  mutate(lineage = stringr::str_replace(lineage, ";[^;]*$", "")) %>%
+  
+  select(lineage) %>%
+  filter(!duplicated(lineage)) %>%
+  tidyr::separate(lineage, into = tl, sep = ";", remove = FALSE)
+
+taxa2 <- taxa %>%
+  filter(Species != "NA")
+```
+
+
+## export taxa list
+Set eval=FALSE — run only to regenerate the taxa list.
+```{r export_taxa, eval=FALSE, include=FALSE}
+# data.table::fwrite(taxa,
+#   paste0(dir, export_file, "Red_sea_eDNA_taxa_v2.csv"), row.names = FALSE)
+```
+
+
+## WoRMS accepted names
+this is now done in the reference libraries
+however, left because it does´t matter and to get if species are marine
+
+```{r worms_info}
+xx  <- taxa2$Species
+z   <- 50
+stt <- seq(1, length(xx), by = z)
+
+worm_info_list <- vector("list", length(stt))
+for (idx in seq_along(stt)) {
+  i   <- stt[idx]
+  j   <- if (i == last(stt)) length(xx) else i + (z - 1)
+  g   <- xx[i:j]
+  gg  <- worrms::wm_records_names(name = g, fuzzy = FALSE, marine_only = FALSE)
+  gg  <- Filter(Negate(is.null), gg)   # drop NULLs (names not found in WoRMS)
+  worm_info_list[[idx]] <- if (length(gg) > 0) bind_rows(gg) else NULL
+  print(j)
+}
+worm_info <- bind_rows(worm_info_list)
+
+worm_info <- worm_info %>%
+  dplyr::select(AphiaID, scientificname, valid_AphiaID, valid_name,
+                kingdom, phylum, class, order, family, genus, isMarine) %>%
+  dplyr::rename(AphiaID_old    = AphiaID,
+                species_ncbi   = scientificname,
+                species_worrms = valid_name) %>%
+  dplyr::rename(AphiaID = valid_AphiaID) %>%
+  dplyr::arrange(dplyr::desc(isMarine)) %>%   # prefer marine records when name has multiple hits
+  dplyr::distinct(species_ncbi, .keep_all = TRUE)
+```
+
+
+## WoRMS attributes (body size, functional group, feeding type)
+```{r worms_attr}
+xx  <- worm_info$AphiaID[complete.cases(worm_info$AphiaID)]
+xx  <- xx[!duplicated(xx)]
+z   <- 50
+stt <- seq(1, length(xx), by = z)
+
+for (i in stt) {
+  j   <- if (i == last(stt)) length(xx) else i + (z - 1)
+  g   <- xx[i:j]
+  gg  <- worrms::wm_attr_data_(id = g, include_inherited = TRUE)
+  ggg <- bind_rows(gg)
+  if (i == 1) { worm_att1 <- ggg } else { worm_att1 <- rbind(worm_att1, ggg) }
+  print(j)
+}
+```
+
+
+## tidy attributes
+```{r tidy_attr}
+# NOTE: WoRMS API now returns 'children' as a list of data frames rather than
+# a JSON string. Replaced separate() + qdapRegex string parsing with
+# purrr::map + unnest to extract unit and measure_defn from nested data frames.
+worm_att1_2 <- worm_att1 %>%
+  dplyr::mutate(
+    children = purrr::map(children, function(ch) {
+      if (!is.data.frame(ch) || nrow(ch) == 0)
+        return(data.frame(unit = NA_character_, measure_defn = NA_character_))
+      data.frame(unit         = as.character(ch$measurementValue),
+                 measure_defn = as.character(ch$measurementType))
+    })
+  ) %>%
+  tidyr::unnest(children) %>%
+  dplyr::select(AphiaID, measurementType, measurementValue, measure_defn, unit,
+                AphiaID_Inherited, source_id) %>%
+  dplyr::ungroup() %>%
+  dplyr::mutate(AphiaID = as.numeric(AphiaID))
+
+## body size
+worm_att1_bs <- worm_att1_2 %>%
+  filter(measurementType %in% c("Body size (qualitative)", "Body size")) %>%
+  mutate(size_mm = -100) %>%
+  mutate(size_mm = if_else(unit == "mm", as.numeric(measurementValue), size_mm)) %>%
+  mutate(size_mm = if_else(unit == "µm", as.numeric(measurementValue) / 1000, size_mm)) %>%
+  mutate(size_mm = if_else(unit == "cm", as.numeric(measurementValue) * 10, size_mm)) %>%
+  mutate(size_mm = replace(size_mm, size_mm < 0, NA)) %>%
+  select(-measurementType) %>%
+  group_by(AphiaID) %>%
+  summarize(max_size_mm = max(size_mm, na.rm = TRUE)) %>%
+  dplyr::rename(max_body_size_mm = max_size_mm)
+
+## functional group (adult / larva)
+worm_att1_fg <- worm_att1_2 %>%
+  filter(measurementType == "Functional group") %>%
+  select(AphiaID, measurementValue, unit) %>%
+  mutate(unit = if_else(unit == "larva > planula", "larva_planula", unit)) %>%
+  distinct() %>%
+  filter(!(AphiaID == 103862 & measurementValue == "benthos > macrobenthos")) %>%
+  filter(!(AphiaID == 112849 & measurementValue == "benthos > meiobenthos")) %>%
+  filter(!(AphiaID == 115723 & measurementValue == "benthos > meiobenthos")) %>%
+  filter(!(AphiaID == 115960 & measurementValue == "benthos > meiobenthos")) %>%
+  filter(!(AphiaID == 136084 & measurementValue == "benthos > macrobenthos")) %>%
+  filter(!(AphiaID == 355663 & measurementValue == "plankton > mesoplankton")) %>%
+  filter(!(AphiaID == 410749 & measurementValue == "benthos > meiobenthos")) %>%
+  filter(!(AphiaID == 206950 & measurementValue == "plankton > mesoplankton")) %>%
+  filter(!(AphiaID == 206952 & measurementValue == "plankton > mesoplankton")) %>%
+  filter(!(AphiaID == 207211 & measurementValue == "plankton > mesoplankton")) %>%
+  filter(!(AphiaID == 220588 & measurementValue == "benthos > macrobenthos")) %>%
+  filter(!(AphiaID == 231751 & measurementValue == "benthos > macrobenthos")) %>%
+  filter(!(AphiaID == 110303 & measurementValue == "mixoplankton > Constitutive Mixoplankton")) %>%
+  filter(!(AphiaID == 234031 & measurementValue == "benthos > epibenthos")) %>%
+  filter(!(AphiaID == 427742 & measurementValue == "plankton > microplankton")) %>%
+  filter(!(AphiaID == 663583 & measurementValue == "plankton > nanoplankton")) %>%
+  pivot_wider(names_from = unit, values_from = measurementValue, values_fill = NA,
+              values_fn = dplyr::first) %>%
+  mutate(adult = if_else(complete.cases(polyp) & polyp == "benthos", polyp, adult)) %>%
+  mutate(larva = if_else(complete.cases(larva_planula), larva_planula, larva)) %>%
+  dplyr::select(AphiaID, adult, larva) %>%
+  dplyr::rename(functional_group_adult = adult, functional_group_larva = larva)
+
+## feeding type
+worm_att1_ft <- worm_att1_2 %>%
+  filter(measurementType == "Feedingtype") %>%
+  filter(unit != "larva" | is.na(unit)) %>%
+  dplyr::select(AphiaID, measurementValue) %>%
+  dplyr::rename(feeding_type = measurementValue) %>%
+  mutate(ft2 = feeding_type) %>%
+  mutate(ft2 = if_else(grepl("deposit",    feeding_type), "deposit feeder",              ft2)) %>%
+  mutate(ft2 = if_else(grepl("parasitic",  ft2),          "parasitic",                   ft2)) %>%
+  mutate(ft2 = if_else(grepl("carnivore",  ft2),          "predator",                    ft2)) %>%
+  mutate(ft2 = if_else(grepl("grazer",     ft2),          "grazer",                      ft2)) %>%
+  mutate(ft2 = if_else(grepl("suspension", ft2),          "suspension or filter feeder", ft2)) %>%
+  mutate(ft2 = if_else(grepl("filter",     ft2),          "suspension or filter feeder", ft2)) %>%
+  mutate(ft2 = if_else(AphiaID == 413379, "grazer",                        ft2)) %>%
+  mutate(ft2 = if_else(AphiaID == 207675, "suspension or filter feeder",   ft2)) %>%
+  mutate(ft2 = if_else(AphiaID == 106623, "parasitic",                     ft2)) %>%
+  dplyr::select(AphiaID, ft2) %>%
+  dplyr::rename(feeding_type = ft2) %>%
+  distinct(AphiaID, .keep_all = TRUE)
+
+## join all traits back to worm_info
+worm_info2 <- worm_info %>%
+  left_join(worm_att1_bs) %>%
+  left_join(worm_att1_fg) %>%
+  left_join(worm_att1_ft) %>%
+  dplyr::rename(AphiaID_ncbi = AphiaID_old)
+## check: should have same number of rows as worm_info !!!!!
+```
+
+
+## combine traits with taxonomy
+```{r combine}
+taxa2 <- taxa %>%
+  dplyr::rename(species_ncbi = Species) %>%
+  left_join(worm_info2)
+```
+
+
+## export raw traits
+```{r export_traits}
+data.table::fwrite(taxa2,
+  paste0(dir, export_file, "Red_sea_eDNA_traits2_v3.csv"),
+  sep = ",")
+```
+
+
+
+## clean curated traits for 4th corner analysis
+Import the fully manually-curated file (additional columns added outside R)
+and standardise categories for use in RLQ / fourth-corner analysis.
+```{r clean_new, eval=FALSE, include=FALSE}
+dat_raw <- openxlsx::read.xlsx(
+  xlsxFile = paste0(dir, "Red_sea_eDNA_traits.xlsx")
+)
+
+dat1 <- dat_raw %>%
+  select(lineage:Species, isMarine, AS_catagory:Planktonic.larval.form,
+         tropic.reference:larvel.reference)
+
+dat2 <- dat1 %>%
+    mutate(trophic.level = if_else(
+    lineage == "Eukaryota;Fungi;Ascomycota;Dothideomycetes;Pleosporales;Phaeosphaeriaceae;Ophiosphaerella;Ophiosphaerella herpotricha",
+    "detritovore", trophic.level)) %>%
+  mutate(trophic.level = if_else(
+    lineage == "Eukaryota;Fungi;Ascomycota;Dothideomycetes;Pleosporales;Didymellaceae;Boeremia;Boeremia exigua",
+    "detritovore", trophic.level)) %>% 
+  mutate(trophic.level = if_else(
+    trophic.level %in% c("parasite", "pathogen"),
+    "parasite/pathogen", trophic.level)) %>%
+  mutate(trophic.level = if_else(
+    trophic.level %in% c("detritivore", "deposit feeders"),
+    "detritivore/deposit feeder", trophic.level)) %>%
+  mutate(zone = if_else(zone == "pelagic",    "planktonic", zone)) %>%
+  mutate(zone = if_else(zone == "intertidal", "benthic",    zone)) %>%
+  filter(zone != "land") %>%
+  mutate(Planktonic.larval.form = if_else(
+    Planktonic.larval.form == "both", "yes", Planktonic.larval.form))
+
+
+```
+
+## check new decontam filtering
+Import the fully manually-curated file (additional columns added outside R)
+check against new list of taxa and add new data - mar 2026
+```{r clean_new, eval=FALSE, include=FALSE}
+# dat_raw <- data.table::fread(file = paste0(dir, "Red_sea_eDNA_traits.csv"), sep = ",")
+dat_raw <- openxlsx::read.xlsx(
+  xlsxFile = paste0(dir, "Red_sea_eDNA_traits_may2021.xlsx")
+)
+names(dat_raw)
+names(worm_info3)
+
+worm_info3 <- worm_info2 %>%
+  dplyr::rename(Species=species_worrms) %>%
+  unite("lineage", kingdom, phylum, class, order, family, genus, Species , sep = ";", remove = FALSE)
+
+
+# tidy original data from 2020
+# remove suprakingdom from lineage
+dat1 <- dat_raw  %>%
+  mutate(lineage = sub("^[^;]+;", "", lineage))
+
+df_dup <- dat1 %>%
+  group_by(lineage) %>%
+  filter(n() > 1) %>%
+  ungroup()
+ # select(lineage:Species, isMarine, AS_catagory:Planktonic.larval.form,
+    #     tropic.reference:larvel.reference)
+
+
+# add any new taxa to older trait csv
+names(dat1) <- tolower(names(dat_raw))
+names(worm_info3) <- tolower(names(worm_info3))
+names(taxa) <- tolower(names(taxa))
+
+# fix text of taxa to match new data
+cols4 <- c("kingdom", "phylum", "class", "order", 
+          "family", "genus", "species")
+
+
+taxa_full <- taxa  %>%
+  mutate(lineage = sub("^[^;]+;", "", lineage)) %>% 
+# has ´NA´from separate, need to remove
+ mutate(across(all_of(cols4), ~na_if(., "NA"))) 
+
+# prep and add original traits to new list of species
+cols <- c("lineage", "kingdom", "phylum", "class", "order", 
+          "family", "genus", "species")
+
+clean <- function(x) tolower(trimws(as.character(x)))
+
+dat2 <- dat1 %>% 
+  select(-superkingdom) %>% 
+  full_join(
+  worm_info3 ,
+  by = cols
+)
+
+# add taxa without species that were removed in tidy species list names(taxa) names(dat2)
+ 
+cols2 <- c("lineage", "kingdom", "phylum", "class", "order", 
+          "family", "genus", "species")
+is_missing <- function(x) is.na(x) | x == ""
+
+dat3 <- dat2 %>%  # names(dat3)
+  bind_rows(taxa_full %>% anti_join(dat2, by = cols2)) %>%
+  arrange(lineage) %>% 
+  select(where(~ !all(is.na(.)))) %>% 
+  # combine ismarine columns
+  mutate(
+    ismarine = case_when(
+      is_missing(ismarine.x) & is_missing(ismarine.y) ~ NA_character_,
+      ismarine.x == 1 | ismarine.y == 1 ~ "1",
+      is_missing(ismarine.x) ~ as.character(ismarine.y),
+      is_missing(ismarine.y) ~ as.character(ismarine.x),
+      ismarine.x == ismarine.y ~ as.character(ismarine.x),
+      TRUE ~ paste(ismarine.x, ismarine.y, sep = ",")
+    )
+  ) %>% 
+  select(-ismarine.x, -ismarine.y, -species_clean, -aphiaid, -aphiaid_ncbi, -superkingdom)
+
+
+
+```
+
+## export updated list to fill traits
+Set eval=FALSE — run only to regenerate the curated traits file.
+```{r export_curated, eval=FALSE, include=FALSE}
+data.table::fwrite(dat3,
+  paste0(dir, "Red_sea_eDNA_traits_togetinfo_mar2026.csv"),
+  sep = ",")
+```
+
+
+
+## export curated traits
+Set eval=FALSE — run only to regenerate the curated traits file.
+```{r export_curated, eval=FALSE, include=FALSE}
+data.table::fwrite(dat2,
+  paste0(dir, "Red_sea_eDNA_traits_curated_mar2026.csv"),
+  sep = ",")
+```
+
+
+## Session info
+Records R version and exact package versions used — important for reproducibility.
+```{r session_info}
+sessionInfo()
+```
