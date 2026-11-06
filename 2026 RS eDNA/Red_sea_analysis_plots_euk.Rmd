@@ -5,6 +5,7 @@ date: "2026 update"
 output: github_document
 ---
 
+## Setup
 set table options
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = TRUE)
@@ -79,6 +80,20 @@ colorRampAlpha <- function(..., n, alpha) {
    paste(colors, sprintf("%x", ceiling(255*alpha)), sep="")
 }
 
+## keep the Mac awake during long chunks (manyglm, fourth corner). caffeinate is
+## tied to this R process (-w), so it also stops if R quits or crashes.
+## -i idle sleep, -m disk sleep, -s system sleep (on power). Closing the lid still sleeps.
+keep_awake <- function() {
+  if (Sys.info()[["sysname"]] == "Darwin")
+    system(sprintf("caffeinate -ims -w %d >/dev/null 2>&1 &", Sys.getpid()))
+  invisible(NULL)
+}
+allow_sleep <- function() {
+  if (Sys.info()[["sysname"]] == "Darwin")
+    system(sprintf("pkill -f 'caffeinate -ims -w %d'", Sys.getpid()))
+  invisible(NULL)
+}
+
 ```
 
 
@@ -93,7 +108,7 @@ export_file <- ""       # CSV exports → dir  (empty = same as dir)
 plot_file   <- "plots"  # plots subfolder: dir/plots/
 
 # filtered sequence data (output of post-DADA2 Rmd)
-dat_name <- paste0(stud_pat, "_filtered_data_all.csv")
+dat_name <- paste0(stud_pat, "_filtered_data_all.csv.gz")   # fread reads .gz directly (needs R.utils)
 
 
 ## set some other universal variables
@@ -152,8 +167,9 @@ sa    <- rnaturalearth::ne_countries(scale='large', country = 'Saudi Arabia', re
 #  import taxonomy assigned to sequences    names(dat)
 dat<-data.table::fread(file=paste(dir,export_file,dat_name, sep=""), sep=",")
 
-##   import trait data — cleaned version produced by Red_sea_trait_cleaning.Rmd
-trait_dat <- data.table::fread(paste0(dir, "Red_sea_eDNA_traits_cleaned.csv"))
+##   import trait data — final traits (publish_table chunk of Red_sea_traits_clean_and_fill.Rmd)
+trait_dat <- data.table::fread(paste0(dir, "Red_sea_eDNA_trait_data.csv"), encoding = "UTF-8",
+                               na.strings = c("", "NA"))   # blank = missing trait
 
 ## import env data
 env <- data.table::fread(file = paste0(dir, "Red_sea_eDNA_enviro_var.csv"), sep = ",")
@@ -162,55 +178,9 @@ env <- data.table::fread(file = paste0(dir, "Red_sea_eDNA_enviro_var.csv"), sep 
 ```
 
 
-## Set minimum reads
-```{r set_mins_divs}
-
-# fac includes -per sample     reads, mean hab reads ,rich, div
-
-####      !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
-#   !!!!!!!!! take a look at rare_mins, most in cores have very low     !!!!!!!!!!!!!!!!!!!!
-####      !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
-### get summary number of reads per sample (only true samples).. for rarefy
-rare_mins<-dat %>%   # names(dat_filt_taxa_df)
-  filter(type=="sample") %>% 
-  dplyr::select(primer_taxassign_id, sample_id_u, reads) %>% 
-  group_by(primer_taxassign_id,sample_id_u) %>% 
-  summarise(sum_sample=sum(reads)) %>% 
-  group_by(primer_taxassign_id) %>% 
-  summarise(min_sample=min(sum_sample),upper_quant=quantile(sum_sample, probs=0.75),  low_quant=quantile(sum_sample, probs=0.25), seventyfivepercent_lower=0.75*low_quant, fiftypercent_lower=0.50*low_quant, one_third_lower=0.333*low_quant, low_10percent=quantile(sum_sample, probs=0.10), lower_wisker= low_quant -( (upper_quant-low_quant)*0.5 ) , median=median(sum_sample), mean=mean(sum_sample),num_samp=n(),samp_below_quant= length(sum_sample[sum_sample<low_quant]), samp_below_75= length(sum_sample[sum_sample<seventyfivepercent_lower]), samp_below_50= length(sum_sample[sum_sample<fiftypercent_lower]), samp_below66 = length(sum_sample[sum_sample < one_third_lower]) , samp_below_10p= length(sum_sample[sum_sample<low_10percent]), samp_below_wisk= length(sum_sample[sum_sample<lower_wisker]))
-#   !!!!!!!!! take a look, most in cores have very low rare to 3000 remove any sample less than 1000
-# Feb 2021, try to automate rarefy decision.....
-#  seems like fair trade off between being too stringent for min. reads and removing samples with fewer reads than min ..
-#   use lower quartile (75% of samples) for minimum for rarefaction and then remove 10% of samples with low reads.
-##  this results in about 10% samples removed and 10% of samples have reads below rarefaction minumum.
-
-##   !!!!!!!!!!!!!!!!!!!
-#   set min and remove_sample
-#  min_num_rarefaction<-3000
-#   sample_read_min<-1000
-#  BETTER  !!!!!!    or set rare and min for each miseq run     # names(rare_mins)
-min_reads_min<-rare_mins[,c(1,4,6)]
-min_num_rarefaction<-as.vector(rare_mins$low_quant)
-sample_read_min<-as.vector(rare_mins$fiftypercent_lower)
-
-# The data-driven threshold (50% of Q1) gives 4713 (18smini) and 4851 (euka02).
-# A fixed cutoff of 4500 is used instead: two borderline samples were excluded
-# by the data-driven threshold despite one primer performing well (>24000 reads):
-#   DC 2017 M D1 (Mangrove): euka02 = 4564 reads, 18smini = 32635 reads
-#   DC 2017 S6   (Seagrass): 18smini = 4520 reads, euka02 = 24129 reads
-# Both samples are just below the data-driven threshold for one primer only;
-# the other primer has excellent coverage. A cutoff of 4500 recovers both
-# without altering the status of any other sample.
-min_reads_min <- min_reads_min %>%
-  mutate(fiftypercent_lower = 4500)
-```
-
 ## Replicate analysis
-```{r rep_anal}
-## Placeholder — no replicate samples in this dataset; chunk reserved for future use.
-
-
-```
+Extraction replicates are excluded here (`tiding`); the replicate diagnostics are in the
+`rep_anal` chunk of `Red_Sea_post_DADA2_filter_and_tidy_withdecon.Rmd`.
 
 
 
@@ -264,14 +234,6 @@ env <- env %>%   # names(env)
 dat_all<- dat %>%   # names(dat)   names(dat_all)
   filter(reads>0) %>%
 
-  ## strip XML artifact prefix from sample_id — the sequence CSV has
-  ## 'xml:space="preserve">' (or double-quote-escaped variant) prepended to
-  ## CCF sample IDs. Match everything up to and including the first '>',
-  ## then trim whitespace to catch trailing spaces left after stripping.
-  mutate(sample_id = stringr::str_trim(
-    stringr::str_remove(sample_id, '^xml:space[^>]*>')
-  )) %>%
-
   ## ── Strip numeric cluster suffix from lineage ─────────────────────────────
   ## The decon version of post_DADA2_filter_and_tidy.Rmd appends a DECIPHER
   ## cluster number as the final ;-delimited field (e.g. "...;Genus sp;-42").
@@ -280,6 +242,17 @@ dat_all<- dat %>%   # names(dat)   names(dat_all)
   ## Must happen FIRST: different primers get different cluster IDs for the same
   ## taxon, so the suffix blocks correct collapsing across primers downstream.
   mutate(lineage = stringr::str_replace(lineage, ";-?\\d+$", "")) %>%
+
+  ## ── Collapse clusters sharing the same taxonomy ───────────────────────────
+  ## After the strip, two 97% clusters with identical taxonomy become duplicate
+  ## lineage rows within the same sample × primer. Sum their reads so each
+  ## taxon is one row per sample × primer; otherwise the mean across primers in
+  ## dat_all_filt_combine_prim averages over clusters as well as primers.
+  ## All other columns are sample-level and constant within the group.
+  ## NOTE: rich / rich_rare / shan_div from the filter script are still
+  ## cluster-based (computed before this collapse).
+  group_by(across(-c(reads, rare_reads))) %>%
+  summarise(reads = sum(reads), rare_reads = sum(rare_reads), .groups = "drop") %>%
 
   mutate(type_3cat=forcats::fct_recode(type, "blank"="extraction blank", "blank" = "pcr blank", "mock" = "positive control")) %>%
   
@@ -311,42 +284,27 @@ dat_all_filt <- dat_all %>%
   # only samples
   filter(type=="sample") %>% 
 
-    ## !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
-    ## remove samples with minimal reads — fixed cutoff of 4500 reads
-    ## (data-driven 50% Q1 gives 4713 / 4851; lowered to recover two
-    ##  borderline samples with one strong and one near-threshold primer)
-  left_join(min_reads_min)  %>%  # names(min_reads_min)
-  filter(sample_sum_after_filt > fiftypercent_lower) %>%
-  select(-low_quant, -fiftypercent_lower) %>%
+    ## all filters (incl. low-read samples, both primers, non-marine taxa) are in
+    ## Red_Sea_post_DADA2_filter_and_tidy_withdecon.Rmd (moved 2026-10-23)
 
     ## !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
-    ## change % reads to rarefied % !!!!!!!  !!!!!!!!!!!!!!!!!!!!!!!!!
+    ## % reads from NON-rarefied reads (decided 2026-10-22): richness does not
+    ## increase with reads per sample (see rarefaction_check), and rarefying to
+    ## the lower quartile changed richness by < 10 taxa per sample.
+    ## rare_reads is kept in the data for the rarefaction_check diagnostic only.
   group_by(sample_id, primer) %>%
-  mutate(rare_reads_sum=sum(rare_reads)) %>%
-  mutate(percent_reads = rare_reads/rare_reads_sum)
+  mutate(reads_sum = sum(reads)) %>%
+  mutate(percent_reads = reads / reads_sum)
   # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 
-## ── Remove non-marine / contaminant taxa ─────────────────────────────────────
-## Applied here so all downstream objects (euk_phylum, euk_order, and the
-## per-primer supplementary figures) are clean.
-## Join key mismatch: data lineages start with "Eukaryota;" (Superkingdom field
-## from tl), but trait_dat lineages start at Kingdom ("Animalia;..."). Strip the
-## leading superkingdom field into a temporary column for the join only.
-dat_all_filt <- dat_all_filt %>%
-  ungroup() %>%
-  mutate(.lj = sub("^[^;]+;", "", lineage)) %>%
-  left_join(dplyr::select(trait_dat, lineage, not_marine_contam),
-            by = c(".lj" = "lineage")) %>%
-  dplyr::filter(is.na(not_marine_contam) | not_marine_contam != 1) %>%
-  dplyr::select(-not_marine_contam, -.lj)
-
-
-# get list of samples that have both primers - some samples removed by low reads, then use below
+# samples with both primers — the filter script already keeps only these
+# (require_both_primers); kept as an object for the audit / check chunks
 samples_both_prim <- dat_all_filt %>% 
       distinct(primer,sample_id) %>% 
       group_by(sample_id) %>% 
       summarise(num_primers_sample=n()) %>% 
       filter(num_primers_sample >1)
+stopifnot(n_distinct(dat_all_filt$sample_id) == nrow(samples_both_prim))
 
 
 
@@ -363,9 +321,7 @@ dat_all_filt_combine_prim <- dat_all_filt %>%   # names(dat_all_filt)
     .groups          = "drop"
   ) %>%
   arrange(sample_id) %>%
-  tidyr::separate(lineage, into=tl, sep=";" , remove=FALSE) %>%
-  # remove samples that don't have both primers
-  inner_join(select(samples_both_prim, sample_id))
+  tidyr::separate(lineage, into=tl, sep=";" , remove=FALSE)
 
 ## ---- assign global N→S sample numbers (1 = northernmost) -------------------
 ## Numbers are consistent across all habitats so that y-axis positions in
@@ -496,6 +452,182 @@ dat_all_filt %>%
   tidyr::separate(lineage, into = tl, sep = ";", remove = FALSE) %>%
   select(Order, Family, Genus, Species, mean_pct) %>%
   print()
+
+## ── 9. Per-sample richness: 97% clusters vs collapsed taxa vs combined ───────
+## Presence = reads > 0 (non-rarefied; percent_reads > 0 downstream).
+## n_clusters  = taxonomy+cluster units from the filter script (before strip)
+## n_taxa      = unique lineages after strip + collapse, per primer
+## n_combined  = unique lineages per sample after combining primers
+final_samples <- unique(dat_all_filt_combine_prim$sample_id)
+
+rich_clusters <- dat %>%
+  filter(minboot == 70, type == "sample", reads > 0) %>%
+  mutate(sample_id = stringr::str_trim(stringr::str_remove(sample_id, '^xml:space[^>]*>')),
+         primer = dplyr::recode(primer, "euka02" = "18S_V7", "18smini" = "18S_V9"),
+         lineage_strip = stringr::str_replace(lineage, ";-?\\d+$", "")) %>%
+  filter(sample_id %in% final_samples) %>%
+  semi_join(distinct(dat_all_filt, primer, lineage) %>% mutate(primer = as.character(primer)),
+            by = c("primer", "lineage_strip" = "lineage")) %>%
+  count(sample_id, primer, name = "n_clusters")
+
+rich_taxa <- dat_all_filt %>%
+  filter(sample_id %in% final_samples, reads > 0) %>%
+  mutate(primer = as.character(primer)) %>%
+  distinct(sample_id, primer, lineage) %>%
+  count(sample_id, primer, name = "n_taxa")
+
+rich_comb <- dat_all_filt_combine_prim %>%
+  filter(percent_reads > 0) %>%
+  distinct(sample_id, lineage) %>%
+  count(sample_id, name = "n_combined")
+
+rich_compare <- rich_clusters %>%
+  left_join(rich_taxa, by = c("sample_id", "primer")) %>%
+  tidyr::pivot_wider(names_from = primer, values_from = c(n_clusters, n_taxa)) %>%
+  left_join(rich_comb, by = "sample_id")
+
+cat("\nPer-sample richness (median [min–max] across samples):\n")
+rich_compare %>%
+  summarise(across(-sample_id, ~ sprintf("%.0f [%d–%d]", median(.x, na.rm = TRUE),
+                                         min(.x, na.rm = TRUE), max(.x, na.rm = TRUE)))) %>%
+  tidyr::pivot_longer(everything(), names_to = "measure", values_to = "median [range]") %>%
+  print()
+
+cat("\nMedian % of clusters lost when collapsing to taxa, per primer:\n")
+rich_compare %>%
+  summarise(V9 = median(100 * (1 - n_taxa_18S_V9 / n_clusters_18S_V9), na.rm = TRUE),
+            V7 = median(100 * (1 - n_taxa_18S_V7 / n_clusters_18S_V7), na.rm = TRUE)) %>%
+  print()
+```
+
+## Taxa counts and reads vs richness (rarefaction check)
+Taxa counts for the samples that go into the analysis (both primers pass the
+read threshold), and whether richness depends on sequencing depth.
+If observed (unrarefied) richness does not rise with reads per sample, rarefied
+reads may not be needed for the analysis.
+
+```{r rarefaction_check}
+## per sample × primer: reads after all filters (before rarefying) and richness
+rich_depth <- dat_all_filt %>%
+  filter(sample_id %in% samples_both_prim$sample_id) %>%
+  group_by(primer, sample_id, habitat) %>%
+  summarise(reads     = first(sample_sum_after_filt),
+            rich_obs  = n_distinct(lineage[reads > 0]),
+            rich_rare = n_distinct(lineage[rare_reads > 0]),
+            .groups = "drop")
+
+## ── taxa counts ──────────────────────────────────────────────────────────────
+cat("Total taxa (unique lineages) in analysis samples:\n")
+print(dat_all_filt %>%
+  filter(sample_id %in% samples_both_prim$sample_id, reads > 0) %>%
+  group_by(primer) %>%
+  summarise(total_taxa = n_distinct(lineage), n_samples = n_distinct(sample_id)))
+cat(sprintf("Combined (both primers): %d taxa across %d samples\n\n",
+            n_distinct(dat_all_filt_combine_prim$lineage[dat_all_filt_combine_prim$percent_reads > 0]),
+            n_distinct(dat_all_filt_combine_prim$sample_id)))
+
+cat("Taxa per sample (mean ± SE [min–max]):\n")
+rich_comb <- dat_all_filt_combine_prim %>%
+  filter(percent_reads > 0) %>%
+  count(sample_id, name = "rich")
+print(bind_rows(
+  rich_depth %>% group_by(primer) %>%
+    summarise(observed = sprintf("%.0f ± %.0f [%d–%d]", mean(rich_obs), sd(rich_obs) / sqrt(n()), min(rich_obs), max(rich_obs)),
+              rarefied = sprintf("%.0f ± %.0f [%d–%d]", mean(rich_rare), sd(rich_rare) / sqrt(n()), min(rich_rare), max(rich_rare))) %>%
+    mutate(primer = as.character(primer)),
+  tibble(primer = "combined",
+         rarefied = NA_character_,
+         observed = sprintf("%.0f ± %.0f [%d–%d]", mean(rich_comb$rich), sd(rich_comb$rich) / sqrt(nrow(rich_comb)),
+                            min(rich_comb$rich), max(rich_comb$rich)))))
+
+## ── reads vs richness plot ───────────────────────────────────────────────────
+## Spearman correlation per primer × richness type, shown in the facet label
+rd_long <- rich_depth %>%
+  tidyr::pivot_longer(c(rich_obs, rich_rare), names_to = "type", values_to = "richness") %>%
+  mutate(type = dplyr::recode(type, rich_obs = "Observed (not rarefied)", rich_rare = "Rarefied"))
+
+rd_cor <- rd_long %>%
+  group_by(primer, type) %>%
+  summarise(ct = list(cor.test(reads, richness, method = "spearman", exact = FALSE)), .groups = "drop") %>%
+  mutate(lab = sprintf("%s | %s\nSpearman rho = %.2f, p = %.3f", primer, type,
+                       sapply(ct, function(x) x$estimate), sapply(ct, function(x) x$p.value))) %>%
+  select(primer, type, lab)
+
+rd_long <- left_join(rd_long, rd_cor, by = c("primer", "type"))
+
+## rarefaction depth actually used by the filter script (lower quartile of reads
+## per primer; samples below it keep all reads) = max rarefied total per sample
+rare_depth <- dat %>%
+  filter(minboot == 70, type == "sample") %>%
+  group_by(primer, sample_id) %>%
+  summarise(rare_total = sum(rare_reads), .groups = "drop") %>%
+  group_by(primer) %>%
+  summarise(depth = max(rare_total)) %>%
+  mutate(primer = dplyr::recode(primer, "euka02" = "18S_V7", "18smini" = "18S_V9")) %>%
+  left_join(distinct(rd_long, primer, lab) %>% mutate(primer = as.character(primer)), by = "primer")
+cat("\nRarefaction depth per primer:\n"); print(distinct(rare_depth, primer, depth))
+
+p_rare_check <- ggplot(rd_long, aes(reads, richness)) +
+  geom_smooth(method = "loess", formula = y ~ x, colour = "grey30", fill = "grey80", linewidth = 0.6) +
+  geom_point(aes(colour = habitat), size = 2, alpha = 0.8) +
+  geom_vline(data = rare_depth, aes(xintercept = depth), linetype = "dashed", colour = "grey50") +
+  scale_x_log10(labels = scales::comma) +
+  scale_colour_manual(values = c(Coral = "#D73027", Mangrove = "#1A9A72", Seagrass = "#F5A623")) +  # = hab_cols (defined later)
+  facet_wrap(~ lab, scales = "free_y", ncol = 2) +
+  labs(x = "Reads per sample after filtering (log scale; dashed = rarefaction depth)",
+       y = "Richness (taxa)", colour = "Habitat") +
+  theme_bw(base_size = 11) +
+  theme(strip.text = element_text(size = 9))
+
+p_rare_check
+
+ggsave(paste0(dir, plot_file, "/Supp_reads_vs_richness.tiff"),
+       p_rare_check, width = 22, height = 16, units = "cm", dpi = 300)
+```
+
+## Taxa missing traits
+Lists taxa in the final analysis data (`dat_all_filt_combine_prim`: both primers,
+read threshold and non-marine filters applied in the filter script) with their traits from
+`Red_sea_eDNA_trait_data.csv`; `has_traits` = all five analysis traits filled.
+Sorted by number of samples. All taxa in the final data go into manyglm; the
+fourth-corner/RLQ analyses use all taxa with traits.
+
+```{r traits_missing_export}
+tax_ranks <- c("kingdom", "phylum", "class", "order", "family", "genus", "species")
+
+taxa_final <- dat_all_filt_combine_prim %>%
+  filter(percent_reads > 0) %>%
+  mutate(lineage_trait = sub("^[^;]+;", "", lineage)) %>%   # drop "Eukaryota;" to match traits
+  group_by(lineage_trait) %>%
+  summarise(n_samples        = n_distinct(sample_id),
+            mean_pct_reads   = mean(percent_reads),
+            n_primers        = max(count_of_primers),
+            .groups = "drop") %>%
+  dplyr::rename(lineage = lineage_trait) %>%
+  tidyr::separate(lineage, into = tax_ranks, sep = ";", remove = FALSE) %>%
+  mutate(across(all_of(tax_ranks), ~ na_if(., "NA")),
+         lowest_rank = case_when(!is.na(species) ~ "species", !is.na(genus) ~ "genus",
+                                 !is.na(family)  ~ "family",  !is.na(order) ~ "order",
+                                 TRUE ~ "class"))
+
+## ALL taxa in the analysis, with traits joined (blank where missing), sorted by
+## lineage so relatives sit together. has_traits = FALSE marks rows still to fill.
+an_traits  <- c("zone", "trophic_level", "size_class", "planktonic_larva", "mobility")
+trait_cols <- setdiff(names(trait_dat), c("lineage", tax_ranks, "lowest_rank"))
+trait_one  <- trait_dat %>%
+  distinct(lineage, .keep_all = TRUE) %>%
+  select(lineage, all_of(trait_cols))
+
+traits_missing <- taxa_final %>%
+  left_join(trait_one, by = "lineage") %>%
+  mutate(has_traits = if_all(all_of(an_traits), ~ !is.na(.) & . != "")) %>%
+  relocate(has_traits, .after = lowest_rank) %>%
+  arrange(lineage)
+
+cat(sprintf("Taxa in analysis: %d\nMissing traits:   %d\n", nrow(taxa_final), sum(!traits_missing$has_traits)))
+print(count(filter(traits_missing, !has_traits), lowest_rank))
+
+data.table::fwrite(traits_missing, paste0(dir, "Red_sea_eDNA_traits_missing.csv"), sep = ",")
 ```
 
 ## compare mean vs max primer combine
@@ -547,113 +679,6 @@ ggplot(dat_plot, aes(x = abundance,
        title = "Top 20 Orders: Mean vs Max Across Primers") +
   theme_bw() +
   theme(text = element_text(size = 12))
-```
-
-## Sample drop audit
-Cross-checks every sample in the metadata against each filtering stage so you can see exactly where samples were lost and why.
-Produces `drop_audit_df` (one row per sample) and `drop_audit_summary` (counts by habitat × drop stage).
-
-```{r sample_drop_audit}
-
-# ── Ground truth: all intended samples from metadata ─────────────────────────
-# Excludes rep entries (kept separately in the metadata sheet but not analysed).
-sam_meta <- readxl::read_excel(sam_file_path, sheet = "sample_data") %>%
-  dplyr::rename(sample_id = sample_ID) %>%
-  filter(!grepl("rep", sample_id, ignore.case = TRUE)) %>%
-  select(sample_id, HABITAT, AREA, YEAR, SEASON) %>%
-  dplyr::rename(habitat_meta = HABITAT, area_meta = AREA,
-                year_meta = YEAR, season_meta = SEASON)
-
-# ── Stage flags ───────────────────────────────────────────────────────────────
-
-# Stage 1: sample_id appears anywhere in the raw sequence CSV
-in_dat <- dat %>%
-  filter(type == "sample", !grepl("rep", sample_id, ignore.case = TRUE)) %>%
-  distinct(sample_id) %>%
-  mutate(in_dat = TRUE)
-
-# Stage 2: at least one row survives minboot==70 + 18S primer filter
-in_18s_minboot <- dat %>%
-  filter(type == "sample",
-         !grepl("rep", sample_id, ignore.case = TRUE),
-         minboot == 70,
-         grepl("18S|18smini|euka", primer, ignore.case = TRUE)) %>%
-  distinct(sample_id) %>%
-  mutate(in_18s_minboot = TRUE)
-
-# Stage 3: per-sample x primer read sums — determines which primer(s) survive
-#          the low-reads threshold (50% of Q1 across samples)
-reads_check <- dat_all %>%
-  filter(type == "sample",
-         !grepl("rep", sample_id, ignore.case = TRUE),
-         grepl("18S", primer)) %>%
-  distinct(sample_id, primer, primer_taxassign_id, sample_sum_after_filt) %>%
-  left_join(min_reads_min, by = "primer_taxassign_id") %>%
-  mutate(passes_reads = sample_sum_after_filt > fiftypercent_lower)
-
-# Summarise: for each sample, how many primers pass?
-reads_summary <- reads_check %>%
-  group_by(sample_id) %>%
-  summarise(
-    n_primers_sequenced = n(),
-    n_primers_pass      = sum(passes_reads),
-    primers_fail        = paste(primer[!passes_reads],
-                                paste0("(", round(sample_sum_after_filt[!passes_reads]), " reads)"),
-                                collapse = "; "),
-    .groups = "drop"
-  ) %>%
-  mutate(primers_fail = if_else(primers_fail == "", "—", primers_fail))
-
-# Stage 4: sample has both primers after read filter (samples_both_prim)
-in_both_prim <- samples_both_prim %>%
-  mutate(in_both_prim = TRUE)
-
-# ── Build audit table ─────────────────────────────────────────────────────────
-drop_audit_df <- sam_meta %>%
-  left_join(in_dat,          by = "sample_id") %>%
-  left_join(in_18s_minboot,  by = "sample_id") %>%
-  left_join(reads_summary,   by = "sample_id") %>%
-  left_join(in_both_prim,    by = "sample_id") %>%
-  mutate(
-    in_final   = sample_id %in% dat_all_filt_combine_prim$sample_id,
-    drop_stage = case_when(
-      in_final                                                          ~ "retained",
-      is.na(in_dat)                                                     ~ "not_in_sequence_data",
-      is.na(in_18s_minboot)                                             ~ "no_18S_reads_at_minboot70",
-      !is.na(n_primers_pass) & n_primers_pass == 0                      ~ "low_reads_both_primers",
-      !is.na(n_primers_pass) & n_primers_pass < n_primers_sequenced     ~ "low_reads_one_primer",
-      is.na(in_both_prim)                                               ~ "only_one_primer_sequenced",
-      TRUE                                                              ~ "unknown"
-    )
-  )
-
-# ── Summary table: counts by habitat x drop stage ────────────────────────────
-drop_audit_summary <- drop_audit_df %>%
-  group_by(habitat_meta, drop_stage) %>%
-  summarise(n = n(), .groups = "drop") %>%
-  tidyr::pivot_wider(names_from = drop_stage, values_from = n, values_fill = 0) %>%
-  select(habitat_meta,
-         any_of(c("retained",
-                  "not_in_sequence_data",
-                  "no_18S_reads_at_minboot70",
-                  "low_reads_both_primers",
-                  "low_reads_one_primer",
-                  "only_one_primer_sequenced",
-                  "unknown"))) %>%
-  mutate(total_in_metadata = rowSums(across(where(is.numeric))),
-         pct_retained = round(retained / total_in_metadata * 100, 1))
-
-print(drop_audit_summary)
-
-# ── Per-sample detail for dropped samples ─────────────────────────────────────
-drop_audit_dropped <- drop_audit_df %>%
-  filter(drop_stage != "retained") %>%
-  select(sample_id, habitat_meta, area_meta, year_meta,
-         drop_stage, primers_fail) %>%
-  arrange(habitat_meta, drop_stage, sample_id)
-
-print(drop_audit_dropped)
-
 ```
 
 ## spread
@@ -1210,8 +1235,8 @@ p_overview <- ggplot() +
     legend.text          = element_text(size = 11),
     panel.border         = element_rect(fill = NA, colour = "black", linewidth = 0.6),
     panel.background     = element_rect(fill = "#D6EAF8"),
-    axis.text            = element_text(size = 11),
-    axis.title.y         = element_text(size = 11),
+    axis.text            = element_text(size = 12),
+    axis.title.y         = element_text(size = 13),
     ## right margin = 0 pulls the zoom grid flush
     plot.margin          = margin(5, 0, 5, 5)
   )
@@ -1268,8 +1293,8 @@ make_zoom_panel <- function(label, box, loc, basemap, cols, buf = 0.10) {
                aes(x = lon_j, y = lat_j, colour = habitat), size = 2.6, alpha = 0.70) +
     ggrepel::geom_text_repel(data = sub_loc,
                aes(x = lon_j, y = lat_j, label = sample_num_ns),
-               size = 2.5, colour = "black", fontface = "bold",
-               box.padding = 0.25, point.padding = 0.15,
+               size = 3.5, colour = "black", fontface = "bold",
+               box.padding = 0.30, point.padding = 0.15,
                min.segment.length = 0.3, max.overlaps = Inf,
                segment.colour = "grey50", segment.size = 0.3) +
     scale_colour_manual(values = cols, guide = "none") +
@@ -1293,7 +1318,7 @@ make_zoom_panel <- function(label, box, loc, basemap, cols, buf = 0.10) {
     theme(
       panel.border     = element_rect(colour = "black", fill = NA, linewidth = 1.3),
       panel.background = element_rect(fill = "#D6EAF8"),
-      axis.text        = element_text(size = 10),
+      axis.text        = element_text(size = 11.5),
       axis.ticks       = element_line(linewidth = 0.25),
       plot.margin      = margin(3, 3, 3, 3)
     )
@@ -1323,7 +1348,7 @@ inner <- (p_overview | zoom_grid) + plot_layout(widths = c(2.2, 2.0))
 ## margin — no tick-label area in the way (unlike the y-axis side).
 ## inner is treated as one unit by /, so x_lab spans the full figure width.
 x_lab <- wrap_elements(
-  panel = grid::textGrob("Longitude", gp = grid::gpar(fontsize = 11))
+  panel = grid::textGrob("Longitude", gp = grid::gpar(fontsize = 13))
 ) + theme(plot.margin = margin(0, 0, 0, 0))
 
 sampling_map <- (inner / x_lab) + plot_layout(heights = c(1, 0.04))
@@ -1361,10 +1386,11 @@ theme_bar <- function(base = 10) {
       panel.border     = element_rect(colour = "black", fill = NA, linewidth = 0.8),
       strip.background = element_rect(fill = "grey90", colour = "black"),
       strip.text       = element_text(face = "bold"),
-      axis.text.y      = element_text(size = 6),
+      axis.text.y      = element_text(size = 8),
+      axis.text.x      = element_text(size = 10),
       legend.position  = "right",
-      legend.key.size  = unit(0.35, "cm"),
-      legend.text      = element_text(size = 8),
+      legend.key.size  = unit(0.4, "cm"),   # fits 9.5 pt legend text
+      legend.text      = element_text(size = 9.5),
       plot.caption     = element_text(size = 7, colour = "grey50")
     )
 }
@@ -1424,6 +1450,18 @@ zone_label_df <- tibble::tibble(
             mean(c(zone_lines[3], n_max_ns))),
   label = c("a", "b", "c", "d")
 )
+
+## dot colours for Fig 4 and Fig 6
+pal3    <- wesanderson::wes_palette("Zissou1", 3, type = "continuous")
+## 5-colour diverging scale (used with values at -lim, -lim/9, 0, lim/9, lim): strong
+## blue for negative so it does not blend into a grey-green on the way to yellow;
+## positive side = the Lab midpoint of yellow and red, then red
+pal_div <- c("#08306B", "#2C7FB8", pal3[2],
+             colorRampPalette(c(pal3[2], pal3[3]), space = "Lab")(3)[2], pal3[3])
+## tile shading for Fig 4 and Fig 6: light enough that dark-blue dots stay visible.
+## Only the significant tile is shown in the legend; limits keep it there even when
+## no cell is significant.
+col_sig    <- c("not significant" = "grey92", "significant" = "grey62")
 ```
 
 
@@ -1497,7 +1535,7 @@ fig2 <- ggplot(plot_dat_phylum_stk) +
   facet_grid(. ~ habitat, scales = "free") +
   labs(x = "Relative abundance (%)", y = "Sample (N \u2192 S)", fill = "Phylum") +
   theme_bar() +
-  theme(axis.text.y  = element_text(size = 7),
+  theme(axis.text.y  = element_text(size = 9),
         plot.margin  = margin(5, 30, 5, 5))
 
 fig2
@@ -1575,7 +1613,7 @@ fig_s2_primer <- ggplot(plot_dat_phylum_primer,
   labs(x = "Relative abundance (%)", y = "Sample (N \u2192 S)", fill = "Phylum",
        caption = "Supplementary: phylum composition by primer pair") +
   theme_bar(base = 10) +
-  theme(axis.text.y = element_text(size = 8),
+  theme(axis.text.y = element_text(size = 10),
         strip.text  = element_text(face = "bold", size = 9))
 
 fig_s2_primer
@@ -1630,7 +1668,7 @@ fig3 <- ggplot(plot_dat_order_stk) +
   facet_grid(. ~ habitat, scales = "free") +
   labs(x = "Relative abundance (%)", y = "Sample (N \u2192 S)", fill = "Order") +
   theme_bar() +
-  theme(axis.text.y = element_text(size = 7),
+  theme(axis.text.y = element_text(size = 9),
         plot.margin  = margin(5, 30, 5, 5))
 
 fig3
@@ -1695,7 +1733,7 @@ fig_s3_primer <- ggplot(plot_dat_order_primer,
   labs(x = "Relative abundance (%)", y = "Sample (N \u2192 S)", fill = "Order",
        caption = "Supplementary: top 15 orders by primer pair") +
   theme_bar(base = 10) +
-  theme(axis.text.y = element_text(size = 8),
+  theme(axis.text.y = element_text(size = 10),
         strip.text  = element_text(face = "bold", size = 9))
 
 fig_s3_primer
@@ -1780,7 +1818,7 @@ fig_metaz_zone <- ggplot(metaz_zone_both,
        fill = "Class") +
   theme_bar() +
   theme(strip.text = element_text(face = "bold", size = 9),
-        axis.text.y = element_text(size = 10))
+        axis.text.y = element_text(size = 12))
 
 fig_metaz_zone
 
@@ -1828,8 +1866,136 @@ dat_v <- list(
 
 
 
+## Venn diagrams — primer and habitat overlap
+Top row: orders and genera detected by 18S_V9 and 18S_V7 (each primer's own data,
+before combining). Bottom row: orders and genera by habitat, primers combined
+(`dat_all_filt_combine_prim`). Analysis samples, reads > 0, named at that rank.
+
+```{r venn_primer_overlap}
+## set labels also give the mean ± SE number of taxa at that rank per sample
+## (alpha diversity), next to the pooled totals in the circles (gamma)
+mse <- function(x) sprintf("%.0f ± %.1f per sample", mean(x), sd(x) / sqrt(length(x)))
+## taxon at a rank; rank = "Taxon" = the full lineage (one taxonomic unit = one row of
+## the analysis data, named at any rank, as in the community matrix)
+get_taxon <- function(lineage, rank) {
+  if (rank == "Taxon") return(lineage)
+  stringr::str_split_fixed(lineage, ";", length(tl))[, which(tl == rank)]
+}
+venn_title <- c(Taxon = "Taxa", Order = "Orders", Family = "Families", Genus = "Genera")
+
+## min_pct: a taxon counts for a primer in a sample only if it makes up >= min_pct of
+## that sample's reads for that primer (same rule as make_comm); 0 = every detection
+cut_lab <- function(min_pct) if (min_pct > 0)
+  sprintf("Present at \u2265 %g%% of sample reads", 100 * min_pct) else "All detections"
+
+venn_by_primer <- function(rank, min_pct = 0) {
+  tax_s <- dat_all_filt %>%
+    ungroup() %>%
+    filter(reads > 0, percent_reads >= min_pct) %>%
+    mutate(taxon = get_taxon(lineage, rank)) %>%
+    filter(!is.na(taxon), !taxon %in% c("NA", "")) %>%
+    distinct(sample_id, primer, taxon)
+  tax <- distinct(tax_s, primer, taxon)
+  ## per sample: each primer, and both primers combined
+  per_s <- tax_s %>% count(sample_id, primer)
+  comb  <- tax_s %>% distinct(sample_id, taxon) %>% count(sample_id)
+  sets <- list(`18S_V9` = tax$taxon[tax$primer == "18S_V9"],
+               `18S_V7` = tax$taxon[tax$primer == "18S_V7"])
+  ## set names drawn by hand below the circles: name, then per-sample mean ± SE
+  nm <- tibble(x = c(-0.95, 0.95), y = -1.22, name = names(sets),
+               per = c(mse(per_s$n[per_s$primer == "18S_V9"]),
+                       mse(per_s$n[per_s$primer == "18S_V7"])))
+  cat(sprintf("%s (min_pct %g): 18S_V9 = %d, 18S_V7 = %d, shared = %d, total = %d; per sample: %s\n", rank, min_pct,
+              length(sets[[1]]), length(sets[[2]]),
+              length(intersect(sets[[1]], sets[[2]])), length(union(sets[[1]], sets[[2]])),
+              paste(nm$name, nm$per, collapse = " | ")))
+  ## ggvenn's own counts sit too close together; draw them ourselves, with the
+  ## primer-only counts moved out towards the middle of each crescent
+  ## (ggvenn 2-set geometry: circles radius 1 centred at x = -2/3 and 2/3)
+  n   <- c(only_v9 = length(setdiff(sets[[1]], sets[[2]])),
+           shared  = length(intersect(sets[[1]], sets[[2]])),
+           only_v7 = length(setdiff(sets[[2]], sets[[1]])))
+  lab <- tibble(x = c(-1.05, 0, 1.05), y = 0,
+                label = sprintf("%d\n(%.1f%%)", n, 100 * n / sum(n)))
+  p <- ggvenn::ggvenn(sets, fill_color = c("#677fd8", "#ca913b"),
+    set_name_color = "transparent", text_color = "transparent", fill_alpha = 0.35,   # own labels below
+    stroke_color = "white", stroke_alpha = 0.5, stroke_size = 0.4) +
+    geom_text(data = lab, aes(x, y, label = label), size = 5, lineheight = 0.9, inherit.aes = FALSE) +
+    geom_text(data = nm, aes(x, y, label = name), size = 5, inherit.aes = FALSE) +
+    geom_text(data = nm, aes(x, y - 0.2, label = per), size = 3.8, inherit.aes = FALSE) +
+    expand_limits(y = c(-1.5, 1.05))
+  p + labs(title    = venn_title[[rank]],
+           subtitle = paste0(cut_lab(min_pct), "\nBoth primers: ", mse(comb$n))) +
+    theme(plot.title    = element_text(hjust = 0.5, size = 14, face = "bold"),
+          plot.subtitle = element_text(hjust = 0.5, size = 11))
+}
+
+## a = all detections, b = >= 0.1% presence cutoff
+ven_primer_taxa     <- venn_by_primer("Taxon")
+ven_primer_taxa_cut <- venn_by_primer("Taxon", min_pct = 0.001)
+
+## habitat overlap, primers combined (3-set Venn). min_pct: a taxon counts as present
+## in a sample only if it makes up >= min_pct of that sample's reads in at least one
+## primer (same rule as make_comm / the sensitivity table); 0 = every detection
+venn_by_habitat <- function(rank, min_pct = 0) {
+  tax_s <- dat_all_filt %>%
+    ungroup() %>%
+    filter(reads > 0, percent_reads >= min_pct) %>%
+    mutate(taxon = get_taxon(lineage, rank)) %>%
+    filter(!is.na(taxon), !taxon %in% c("NA", "")) %>%
+    distinct(sample_id, habitat, taxon)
+  tax   <- distinct(tax_s, habitat, taxon)
+  per_s <- tax_s %>% count(sample_id, habitat)
+  habs  <- c("Coral", "Mangrove", "Seagrass")
+  sets  <- split(tax$taxon, tax$habitat)[habs]
+  ## set names drawn by hand: Coral / Mangrove above their circles, Seagrass below
+  nm <- tibble(x = c(-1.05, 1.05, 0), y = c(1.98, 1.98, -1.8), name = habs,
+               per = sapply(habs, function(h) mse(per_s$n[per_s$habitat == h])))
+  cat(sprintf("%s by habitat (min_pct %g): %s; in all three = %d\n", rank, min_pct,
+              paste(names(sets), lengths(sets), nm$per, sep = " = ", collapse = ", "),
+              length(Reduce(intersect, sets))))
+  ## own labels, pushed out from the crowded centre (ggvenn 3-set geometry:
+  ## circles radius 1 centred at (-2/3, 0.62), (2/3, 0.62), (0, -0.62))
+  A <- sets[[1]]; B <- sets[[2]]; C <- sets[[3]]
+  n <- c(A   = length(setdiff(A, union(B, C))), B = length(setdiff(B, union(A, C))),
+         C   = length(setdiff(C, union(A, B))),
+         AB  = length(setdiff(intersect(A, B), C)), AC = length(setdiff(intersect(A, C), B)),
+         BC  = length(setdiff(intersect(B, C), A)), ABC = length(Reduce(intersect, sets)))
+  lab <- tibble(x = c(-1.0, 1.0, 0, 0, -0.6, 0.6, 0),
+                y = c(0.85, 0.85, -0.95, 0.9, -0.05, -0.05, 0.17),
+                label = sprintf("%d\n(%.1f%%)", n, 100 * n / sum(n)))
+  ggvenn::ggvenn(sets, fill_color = c("#D73027", "#1A9A72", "#F5A623"),   # = hab_cols
+    set_name_color = "transparent", text_color = "transparent", fill_alpha = 0.35,
+    stroke_color = "white", stroke_alpha = 0.5, stroke_size = 0.4) +
+    geom_text(data = lab, aes(x, y, label = label), size = 3.6, lineheight = 0.85, inherit.aes = FALSE) +
+    geom_text(data = nm, aes(x, y, label = name), size = 5, inherit.aes = FALSE) +
+    geom_text(data = nm, aes(x, y - 0.2, label = per), size = 3.8, inherit.aes = FALSE) +
+    expand_limits(y = c(-2.1, 2.1)) +
+    labs(title = venn_title[[rank]],
+         subtitle = cut_lab(min_pct)) +
+    theme(plot.title    = element_text(hjust = 0.5, size = 14, face = "bold"),
+          plot.subtitle = element_text(hjust = 0.5, size = 11))
+}
+
+## c = all detections, d = >= 0.1% presence cutoff (how much of the overlap is rare
+## detections; matches the >= 0.1% row of the sensitivity table)
+ven_hab_taxa     <- venn_by_habitat("Taxon")
+ven_hab_taxa_cut <- venn_by_habitat("Taxon", min_pct = 0.001)
+
+## row heights follow each row's y range (ggvenn uses a fixed aspect ratio, so equal
+## heights left a gap above the shorter primer Venns)
+ven_primer <- (ven_primer_taxa | ven_primer_taxa_cut) / (ven_hab_taxa | ven_hab_taxa_cut) +
+  plot_layout(heights = c(2.75, 4.2)) +
+  plot_annotation(tag_levels = "a") &
+  theme(plot.tag = element_text(size = 14, face = "bold"))
+ven_primer
+
+ggsave(paste0(dir, plot_file, "/FigS_venn_primer_habitat_overlap.tiff"),
+       ven_primer, width = 24, height = 24, units = "cm", dpi = 300)
+```
+
 ## Richness and diversity stats
-tests can take 40 min, run caffeinate -dims in terminal to keep computer awake, then CTRL+c to stop
+
 ```{r stat}
 
 #### stats  ######
@@ -1930,16 +2096,35 @@ qqnorm(resid(mod)); qqline(resid(mod))
 ## Use combined-primer data; 1 = OTU detected in sample, 0 = absent.
 ## Presence/absence reduces the influence of highly variable read counts
 ## and is consistent with the Arctic paper (binomial manyglm).
-comm_pa <- dat_all_filt_combine_prim %>%
-  filter(type == "sample") %>%
-  select(sample_id, lineage, percent_reads) %>%
-  group_by(sample_id, lineage) %>%
-  summarise(pres = as.integer(sum(percent_reads, na.rm = TRUE) > 0),
-            .groups = "drop") %>%
-  pivot_wider(names_from  = lineage,
-              values_from = pres,
-              values_fill = 0L) %>%
-  column_to_rownames("sample_id")
+## presence threshold (see rep_anal in the filter script): a taxon counts as present in a sample only if it
+## makes up >= pa_min_pct of that sample's reads in at least one primer.
+## 0.001 = 0.1% (main analysis, decided 2026-10-27): below it, extraction replicates of
+## one sample reproduce only ~42-56% of detections (vs 75-87% above it). 0 = every
+## detection (sensitivity row "all detections").
+pa_min_pct <- 0.001
+## matching dataset in manyglm_shrink_results.rds (Table 1, sensitivity): "pct01" = both
+## primers >= 0.1%; "main" = both primers, all detections (historic name)
+tab1_set <- c("0" = "main", "0.001" = "pct01")[[as.character(pa_min_pct)]]
+
+## make_comm(): presence/absence matrix from the per-primer data. A taxon is present
+## in a sample if it has reads in any of `prims` and makes up >= min_pct of that
+## sample's reads in at least one of them. With both primers and min_pct = 0 this
+## is identical to presence in dat_all_filt_combine_prim. Also used by the
+## sensitivity chunk (single primer, stricter cutoff).
+make_comm <- function(dat, prims = c("18S_V9", "18S_V7"), min_pct = 0) {
+  dat %>%
+    ungroup() %>%
+    filter(type == "sample", primer %in% prims) %>%
+    mutate(pres = as.integer(reads > 0 & percent_reads >= min_pct)) %>%
+    group_by(sample_id, lineage) %>%
+    summarise(pres = max(pres), .groups = "drop") %>%
+    pivot_wider(names_from  = lineage,
+                values_from = pres,
+                values_fill = 0L) %>%
+    column_to_rownames("sample_id")
+}
+
+comm_pa <- make_comm(dat_all_filt, min_pct = pa_min_pct)
 
 ## ---- align env data rows to community matrix rows --------------------------
 ## sdat was built in the stat chunk; subset to samples present in comm_pa.
@@ -1952,23 +2137,34 @@ env_mva <- sdat %>%
 ## reorder community matrix rows to match env_mva
 comm_pa <- comm_pa[as.character(env_mva$sample_id), ]
 
-## remove OTUs present in fewer than 5 samples (~6% occurrence; colSums >= 2
-## is effectively no filter — all 493 taxa already pass it)
-comm_pa <- comm_pa[, colSums(comm_pa) >= 5]
+## no extra occurrence cut: the only occurrence filter is in the filter script
+## (97% cluster in >= min_samples_include = 3 samples). Drop all-zero columns only.
+comm_pa <- comm_pa[, colSums(comm_pa) > 0]
 
-cat("Community matrix:", nrow(comm_pa), "samples ×", ncol(comm_pa), "OTUs\n")
+cat("Community matrix:", nrow(comm_pa), "samples ×", ncol(comm_pa), "OTUs",
+    "(presence threshold", 100 * pa_min_pct, "% of sample reads)\n")
 ```
 
 
 ## manyglm analysis
 
 ```{r manyglm_fit}
+keep_awake()   # stop the Mac sleeping during the bootstraps (allow_sleep() at end)
+
+## cor.type = "I" (2026-10-25): the multivariate statistic is the sum of the per-taxon
+## score statistics; correlation between taxa is handled by PIT-trap resampling of whole
+## samples, so p-values stay valid. "shrink" (Arctic paper) weights the statistic by a
+## ridge-shrunk 865 x 865 taxon correlation matrix: ~26 h per 999 bootstraps on an M2
+## (single-threaded) vs ~7 min for "I". With 9 test bootstraps, habitat and SST were
+## strong under both; distance to shore and PP range only under "I".
+## show.time = "all" prints bootstrap progress.
+
 ## ---- set reference level: Coral ---------------------------------------------
 ## Explicit relevel so habitatMangrove = Mangrove vs Coral,
 ## habitatSeagrass = Seagrass vs Coral in all model output.
 env_mva$habitat <- relevel(factor(env_mva$habitat), ref = "Coral")
 
-## ---- model 1: Coral reference (for Table 1 + Mangrove/Seagrass vs Coral) ---
+## ---- model 1: Coral reference (Table 1 + Mangrove/Seagrass vs Coral) -------
 mva_dat <- mvabund(comm_pa)
 
 mva_mod <- manyglm(
@@ -1978,73 +2174,69 @@ mva_mod <- manyglm(
   nCore  = 4
 )
 summary(mva_mod)
-## mva_aov: multivariate only — fast, used for Table 1.
-## nBoot=999 for publication; 99 for dev runs.
-mva_aov <- anova(mva_mod,
-                 resamp   = "pit.trap",
-                 test     = "score",
-                 cor.type = "shrink",
-                 nBoot    = 999,
-                 p.uni    = "none")
 
-## anova for model 1: gives per-dummy p-values (habitatMangrove, habitatSeagrass)
-## correctly for this model. summary is NOT used here — it applies a more
-## conservative cross-coefficient adjustment that washes out significance.
+## mva_aov_uni: per-taxon p-values (Fig 4) AND the multivariate table (Table 1;
+## $table is the same test as a p.uni = "none" run, so no separate mva_aov run).
+## anova gives per-dummy p-values (habitatMangrove, habitatSeagrass) correctly
+## for this model. summary is NOT used here — it applies a more conservative
+## cross-coefficient adjustment that washes out significance.
+## nBoot = 999 for publication (Table 1); 99 for dev runs.
 mva_aov_uni <- anova(mva_mod,
-                     resamp   = "pit.trap",
-                     test     = "score",
-                     cor.type = "shrink",
-                     nBoot    = 999,
-                     p.uni    = "adjusted")
+                     resamp    = "pit.trap",
+                     test      = "score",
+                     cor.type  = "I",
+                     nBoot     = 999,
+                     p.uni     = "adjusted",
+                     show.time = "all")
+mva_aov <- mva_aov_uni   # cor.type "I" table; Table 1 uses the shrink run if present
 
-## ---- model 2: rebuild everything from scratch with Mangrove as reference ----
-## Completely independent objects (comm_pa2, env_mva2, mva_dat2) to eliminate
-## any state carried over from model 1.
-comm_pa2 <- dat_all_filt_combine_prim %>%
-  filter(type == "sample") %>%
-  select(sample_id, lineage, percent_reads) %>%
-  group_by(sample_id, lineage) %>%
-  summarise(pres = as.integer(sum(percent_reads, na.rm = TRUE) > 0),
-            .groups = "drop") %>%
-  pivot_wider(names_from  = lineage,
-              values_from = pres,
-              values_fill = 0L) %>%
-  column_to_rownames("sample_id")
-
-env_mva2 <- sdat %>%
-  ungroup() %>%
-  filter(as.character(sample_id) %in% rownames(comm_pa2)) %>%
-  arrange(match(as.character(sample_id), rownames(comm_pa2))) %>%
-  as.data.frame()
-
-comm_pa2 <- comm_pa2[as.character(env_mva2$sample_id), ]
-comm_pa2 <- comm_pa2[, colSums(comm_pa2) >= 5]
-
-env_mva2$habitat <- relevel(factor(env_mva2$habitat), ref = "Mangrove")
-
-mva_dat2 <- mvabund(comm_pa2)
+## ---- model 2: Mangrove reference (Seagrass vs Mangrove, Fig 4 SvM column) --
+## Same community matrix and env data as model 1 (so pa_min_pct applies to both);
+## only the habitat reference level changes.
+env_mva2 <- env_mva
+env_mva2$habitat <- relevel(factor(as.character(env_mva2$habitat)), ref = "Mangrove")
 
 mva_mod2 <- manyglm(
-  mva_dat2 ~ habitat + sTemp + snitrate + spp_range + sland_distance,
+  mva_dat ~ habitat + sTemp + snitrate + spp_range + sland_distance,
   data   = env_mva2,
-  family = binomial("cloglog")
+  family = binomial("cloglog"),
+  nCore  = 4
 )
 
+## only the per-taxon habitat tiles are used from model 2 -> nBoot = 499
 mva_aov_uni2 <- anova(mva_mod2,
-                      resamp   = "pit.trap",
-                      test     = "score",
-                      cor.type = "shrink",
-                      nBoot    = 999,
-                      p.uni    = "adjusted")
+                      resamp    = "pit.trap",
+                      test      = "score",
+                      cor.type  = "I",
+                      nBoot     = 499,
+                      p.uni     = "adjusted",
+                      show.time = "all")
 
+allow_sleep()
 ```
 
 
 ## Table 1 — display
 
 ```{r table1_manyglm}
+## Table 1 = cor.type "shrink" run (manyglm_shrink_parallel.R; see "Table 1 and
+## sensitivity with cor.type = shrink" below), the dataset matching pa_min_pct:
+## "pct01" (both primers, >= 0.1%) or "main" (both primers, all detections; the name is
+## historic; tab1_set is set in community_matrix). Falls back to the "I" run.
+shrink_file <- paste0(dir, "manyglm_shrink_results.rds")
+shrink_res  <- if (file.exists(shrink_file)) readRDS(shrink_file) else NULL
+if (!is.null(shrink_res$tables[[tab1_set]])) {
+  tab1_src <- shrink_res$tables[[tab1_set]] %>% dplyr::rename(`Pr(>score)` = p)
+  tab1_cor <- "shrink"
+} else {
+  warning("no shrink results: Table 1 from the cor.type = 'I' run")
+  tab1_src <- as.data.frame(mva_aov$table)
+  tab1_cor <- "I"
+}
+cat("Table 1: cor.type =", tab1_cor, "; dataset", tab1_set, "\n")
+
 ## Column names from mvabund anova table: Res.Df, Df.diff, score, Pr(>score)
-tab1_raw <- as.data.frame(mva_aov$table) %>%
+tab1_raw <- tab1_src %>%
   rownames_to_column("variable") %>%
   filter(variable != "(Intercept)") %>%
   rename(
@@ -2092,10 +2284,108 @@ flextable(tab1_raw) %>%
   colformat_num(j = c("Res. DF", "d.f."), digits = 0) %>%
   colformat_num(j = "Score",   digits = 2) %>%
   colformat_num(j = "p-value", digits = 3) %>%
-  align(j = 1,   align = "left",  part = "all") %>%
-  align(j = 2:5, align = "right", part = "all") %>%
+  flextable::align(j = 1,   align = "left",  part = "all") %>%
+  flextable::align(j = 2:5, align = "right", part = "all") %>%
   theme_booktabs() %>%
   autofit()
+```
+
+
+## Table 1 and sensitivity with cor.type = "shrink" (run outside RStudio)
+
+`cor.type = "shrink"` (recommended in `?anova.manyglm` when feasible; used in the Arctic
+paper) weights the test statistic by a ridge-shrunk taxon correlation matrix, so blocks of
+co-occurring taxa count less. It takes ~26 h per 999 bootstraps on one core here, so the
+multivariate tests run in a standalone script that splits the bootstraps across cores
+(`manyglm_shrink_parallel.R`, fixed seed via `bootID`, so results are reproducible).
+Per-taxon tests (Fig 4) stay cor.type "I" (days with shrink).
+
+Sensitivity: the same test on versions of the community matrix, all with the same 73
+samples. Main (Table 1, decided 2026-10-27) = both primers, a taxon present only at
+>= 0.1% of a sample's reads (`pa_min_pct`; detections below this reproduced poorly
+between extraction replicates). Compared with: both primers with every detection, and
+18S_V9 only / 18S_V7 only at the same 0.1% cutoff. Mantel r = correlation of each
+version's Jaccard distances with the main version. Question: does a single primer
+(cheaper) give the same statistical conclusions, even though it detects fewer taxa?
+Dataset keys in the results file: "main" = all detections (historic name), "pct01" =
+>= 0.1%; v9 / v7 = single primer, all detections (run 2026-10-26, not shown);
+v9_pct01 / v7_pct01 = single primer, >= 0.1%.
+
+Considered and not included (2026-10-26): log extract DNA concentration as a first term.
+It correlates with richness and distance to shore, but coral has the lowest
+concentration and the highest richness, so it is not a clean technical covariate.
+
+`export_mva_inputs` saves the matrices; run it, then in the terminal
+`caffeinate -ims Rscript manyglm_shrink_parallel.R` (datasets already in the results
+file are skipped). `sensitivity` only reads the results.
+
+```{r export_mva_inputs}
+## all versions run by manyglm_shrink_parallel.R; sens_show = rows of the table (first
+## = main = Table 1)
+sens_sets <- list(
+  main     = list(label = "Both primers, all detections", prims = c("18S_V9", "18S_V7"), min_pct = 0),
+  pct01    = list(label = "Both primers, >= 0.1%",        prims = c("18S_V9", "18S_V7"), min_pct = 0.001),
+  v9       = list(label = "18S_V9 only, all detections",  prims = "18S_V9",             min_pct = 0),
+  v7       = list(label = "18S_V7 only, all detections",  prims = "18S_V7",             min_pct = 0),
+  v9_pct01 = list(label = "18S_V9 only, >= 0.1%",         prims = "18S_V9",             min_pct = 0.001),
+  v7_pct01 = list(label = "18S_V7 only, >= 0.1%",         prims = "18S_V7",             min_pct = 0.001)
+)
+sens_show <- c(tab1_set, setdiff(c("pct01", "main", "v9_pct01", "v7_pct01"), tab1_set))
+sens_sets[[tab1_set]]$label <- paste(sens_sets[[tab1_set]]$label, "(main)")
+
+## community matrices on the env_mva samples (same rows, same order)
+sens_comm <- lapply(sens_sets, function(p) {
+  m <- make_comm(dat_all_filt, prims = p$prims, min_pct = p$min_pct)
+  m <- m[as.character(env_mva$sample_id), ]
+  m[is.na(m)] <- 0L                     # sample with no taxa in this version
+  m[, colSums(m) > 0]
+})
+stopifnot(identical(dim(sens_comm[[tab1_set]]), dim(comm_pa)))   # = Table 1 matrix
+
+saveRDS(list(comm = sens_comm, env_mva = env_mva, date = Sys.Date()),
+        paste0(dir, "manyglm_inputs.rds"))
+```
+
+## Sensitivity table (primer and presence cutoff)
+Reads the shrink results; run after `export_mva_inputs` (needs `sens_comm`).
+```{r sensitivity}
+## Jaccard distances; Mantel against the main version
+sens_dist <- lapply(sens_comm[sens_show], vegdist, method = "jaccard", binary = TRUE)
+sens_mantel <- sapply(sens_dist, function(d) {
+  mt <- mantel(sens_dist[[tab1_set]], d, permutations = 999)
+  c(r = unname(mt$statistic), p = mt$signif)
+})
+
+## table: one row per version; score (p) per term from the shrink runs
+sens_tab <- imap_dfr(sens_sets[sens_show], function(p, nm) {
+  tb <- shrink_res$tables[[nm]]
+  cell <- if (is.null(tb)) NULL else {
+    tb <- tb[-1, ]                       # drop intercept row
+    setNames(sprintf("%.1f (%.3f)", tb$score, tb$p), rownames(tb))
+  }
+  tibble(Dataset           = p$label,
+         `Taxa`            = ncol(sens_comm[[nm]]),
+         `Taxa per sample` = round(mean(rowSums(sens_comm[[nm]]))),
+         `Mantel r`        = round(sens_mantel["r", nm], 2),
+         !!!as.list(cell))
+}) %>%
+  rename(any_of(c(Habitat = "habitat", `SST (mean)` = "sTemp", Nitrate = "snitrate",
+                  `Primary productivity (range)` = "spp_range",
+                  `Distance to shore` = "sland_distance"))) %>%
+  mutate(across(-c(Dataset, Taxa, `Taxa per sample`, `Mantel r`),
+                ~ coalesce(., "not run yet")))
+
+kable(sens_tab,
+      caption = paste("Table S. Sensitivity of the multivariate GLM to primer choice and",
+                      "presence cutoff (cor.type = 'shrink',", shrink_res$n_boot,
+                      "PIT-trap bootstraps). Cells = score statistic (p-value), terms",
+                      "tested sequentially; Mantel r = correlation of Jaccard distances",
+                      "with the main dataset."),
+      format = "html") %>%
+  kable_styling(full_width = FALSE, bootstrap_options = NULL)
+
+write.csv(sens_tab, paste0(dir, export_file, "TableS_sensitivity_primer_cutoff.csv"),
+          row.names = FALSE)
 ```
 
 
@@ -2116,8 +2406,7 @@ x_labels  <- c("Mangrove vs Coral", "Seagrass vs Coral", "Seagrass vs Mangrove",
 ## p_min_val is auto-calculated below to display ~15 taxa
 num_clust  <- 5            # hierarchical clusters for y-axis colour grouping
 ccll       <- c(wesanderson::wes_palette("Moonrise2", n = 2), "black")  # matches Arctic
-pal3       <- wesanderson::wes_palette("Zissou1", 3, type = "continuous")  # dot colours
-col_sig    <- c("not significant" = "grey85", "significant" = "grey40")  # explicit mapping
+## pal3 and pal_div (dot colours) are defined in barplot_helpers
 
 ## ── Extract model 1 components ───────────────────────────────────────────────
 ## anova$uni.test: rows = predictors, cols = taxa — transpose to get rows = taxa
@@ -2269,12 +2558,15 @@ lower_coef <- -upper_coef
 dd         <- 2   # divisor for intermediate legend breaks
 
 mult_plot <- ggplot(mult_dat3, aes(xx, yy)) +
-  geom_tile(aes(fill = p_val_col), colour = "grey50") +
-  scale_fill_manual(values = col_sig, na.value = "grey85") +
+  geom_tile(aes(fill = p_val_col), colour = "grey50",
+            width = 0.92, height = 0.92) +   # separated tiles, as in Fig 6
+  scale_fill_manual(values = col_sig, limits = names(col_sig), breaks = "significant",
+                    labels = "p \u2264 0.05", na.value = col_sig[["not significant"]],
+                    name = NULL) +
   geom_point(aes(colour = coef_log, size = test_stat)) +
   scale_color_gradientn(
     name   = "Coefficient",
-    colors = pal3,
+    colors = pal_div,
     space  = "Lab",
     values = scales::rescale(c(lower_coef * 1.1, lower_coef / 9, 0,
                                upper_coef / 9,   upper_coef * 1.1)),
@@ -2287,7 +2579,7 @@ mult_plot <- ggplot(mult_dat3, aes(xx, yy)) +
                       (exp(upper_coef) - 1)), 1),
     oob    = scales::squish
   ) +
-  scale_size(name = "Score stat") +
+  scale_size(name = "Score statistic", range = c(1, 7)) +
   scale_x_continuous(name = NULL,
                      breaks = seq_along(levels(mult_dat3$variable)),
                      labels = x_labels[seq_along(levels(mult_dat3$variable))],
@@ -2296,7 +2588,6 @@ mult_plot <- ggplot(mult_dat3, aes(xx, yy)) +
                      breaks = seq_along(y_labels$y_labels),
                      labels = y_labels$y_labels,
                      expand = expansion(add = 0.5)) +
-  guides(fill = "none") +
   theme_minimal() +
   theme(
     axis.text.x  = element_text(angle = 45, hjust = 1, vjust = 1),
@@ -2316,23 +2607,16 @@ ggsave(mult_plot,
 ## NMDS and ordisurf GAMs
 
 ```{r nmds_gam}
-## ---- NMDS on Bray-Curtis (log-transformed percent reads) -------------------
-comm_pct <- dat_all_filt_combine_prim %>%
-  filter(type == "sample") %>%
-  select(sample_id, lineage, percent_reads) %>%
-  group_by(sample_id, lineage) %>%
-  summarise(percent_reads = sum(percent_reads, na.rm = TRUE), .groups = "drop") %>%
-  pivot_wider(names_from  = lineage,
-              values_from = percent_reads,
-              values_fill = 0) %>%
-  column_to_rownames("sample_id")
+## ---- NMDS on presence/absence (Jaccard) -------------------------------------
+## Same matrix as manyglm (comm_pa), so all analyses use presence/absence; no extra
+## occurrence cut (the old >= 2 samples cut was removed 2026-10-26)
+comm_nmds <- comm_pa[as.character(env_mva$sample_id), ]
+comm_nmds <- comm_nmds[, colSums(comm_nmds) > 0]
 
-comm_pct <- comm_pct[as.character(env_mva$sample_id), ]
-comm_pct <- comm_pct[, colSums(comm_pct > 0) >= 2]
-
-## log(x+1) transformation then Bray-Curtis (as in Arctic paper)
-nmds_res <- metaMDS(log1p(comm_pct),
-                    distance      = "bray",
+set.seed(20261026)   # metaMDS uses random starts
+nmds_res <- metaMDS(comm_nmds,
+                    distance      = "jaccard",
+                    binary        = TRUE,
                     trymax        = 100,
                     autotransform = FALSE,
                     trace         = FALSE)
@@ -2384,8 +2668,8 @@ tab2_raw <- lapply(names(env_vars_gam), function(v) {
 kable(tab2_raw,
       caption = paste("Table 2. Summary output of individually run generalised",
                       "additive models (thin-plate spline). The dependent variable",
-                      "is the eDNA eukaryote community (NMDS, Bray-Curtis on",
-                      "log-transformed percent reads). Stress =",
+                      "is the eDNA eukaryote community (NMDS, Jaccard on",
+                      "presence/absence). Stress =",
                       round(nmds_res$stress, 3), ".",
                       "Variables not included in the manyglm model due to",
                       "covariance (latitude, SST range, primary productivity mean,",
@@ -2417,14 +2701,14 @@ flextable(tab2_raw) %>%
   set_caption(caption = paste(
     "Table 2. Summary of individually run generalised additive models",
     "(thin-plate spline GAM). Dependent variable: eDNA eukaryote community",
-    "(NMDS, Bray-Curtis on log-transformed percent reads). NMDS stress =",
+    "(NMDS, Jaccard on presence/absence). NMDS stress =",
     round(nmds_res$stress, 3), ".")) %>%
   colformat_num(j = c("Est.DF", "Ref.DF"), digits = 2) %>%
   colformat_num(j = "F.value",            digits = 2) %>%
   colformat_num(j = "p.value",            digits = 4) %>%
   colformat_num(j = "deviance_explained", digits = 1) %>%
-  align(j = 1,   align = "left",  part = "all") %>%
-  align(j = 2:6, align = "right", part = "all") %>%
+  flextable::align(j = 1,   align = "left",  part = "all") %>%
+  flextable::align(j = 2:6, align = "right", part = "all") %>%
   theme_booktabs() %>%
   autofit()
 ```
@@ -2434,19 +2718,10 @@ flextable(tab2_raw) %>%
 
 ```{r MDS_GAM}
 ## ── Species labels for NMDS ───────────────────────────────────────────────────
-## Build family-level labels prioritised by total abundance (same as Arctic).
-## taxa_file is dat_all_filt_combine_prim, set in multivar_plot_ggplot above.
-
-cc_pct <- dat_all_filt_combine_prim %>%
-  ungroup() %>%
-  select(sample_id, lineage, percent_reads) %>%
-  pivot_wider(names_from = lineage, values_from = percent_reads, values_fill = 0) %>%
-  column_to_rownames("sample_id")
-
-## align to env_mva order
-cc_pct <- cc_pct[as.character(env_mva$sample_id), colnames(comm_pct)]
-
-cc_name <- data.frame(lineage = colnames(cc_pct))
+## Build family-level labels prioritised by number of samples a taxon occurs in
+## (presence/absence, as the NMDS). taxa_file is dat_all_filt_combine_prim, set in
+## multivar_plot_ggplot above.
+cc_name <- data.frame(lineage = colnames(comm_nmds))
 
 y_labels_mds <- taxa_file %>%
   ungroup() %>%
@@ -2461,8 +2736,11 @@ y_labels_mds <- taxa_file %>%
   unite(y_labels, Phylum:Genus, sep = ";", remove = FALSE) %>%
   mutate(y_labels        = gsub("NA", "Unclassified", y_labels),
          Family_label    = if_else(is.na(Family) | Family == "NA", "", Family),
-         priority_abund  = colSums(cc_pct),
-         priority_abund  = if_else(is.na(Family) | Family == "NA", 0, priority_abund))
+         priority_occ    = colSums(comm_nmds)[lineage],
+         priority_occ    = if_else(is.na(Family) | Family == "NA", 0, priority_occ)) %>%
+  ## same order as the NMDS species scores (orditorp matches labels by position)
+  arrange(match(lineage, colnames(comm_nmds)))
+stopifnot(identical(y_labels_mds$lineage, colnames(comm_nmds)))
 
 ## ── N→S sample rank for site labels (1 = northernmost) ───────────────────────
 site_ranks <- dat_all_filt_combine_prim %>%
@@ -2474,8 +2752,11 @@ env_mva_plot <- env_mva %>%
   left_join(site_ranks, by = "sample_id")
 
 ## ── Plot settings ─────────────────────────────────────────────────────────────
-xlim_c   <- c(-2, 1.5)
-ylim_c   <- c(-1, 1)
+## axis limits from the site scores (+25% for labels), same for all panels; species
+## found in one or two samples lie far outside and are clipped in panel b
+sc_site <- scores(nmds_res, "sites")
+xlim_c  <- range(sc_site[, 1]) * 1.25
+ylim_c  <- range(sc_site[, 2]) * 1.25
 cex_let  <- 1.2
 cex_size <- 0.9
 
@@ -2510,17 +2791,18 @@ add_letter("a")
 ordiplot(nmds_res, type = "n", xlim = xlim_c, ylim = ylim_c)
 points(pl, "sites", pch = 16, col = hab_pt_cols, cex = 1.0)
 orditorp(nmds_res, display = "species", col = "grey30", air = 0.9,
-         priority = y_labels_mds$priority_abund,
+         priority = y_labels_mds$priority_occ,
          labels   = y_labels_mds$Family_label,
          cex = 1.0, pcex = 0)
 add_letter("b")
 
-## (c–d) ordisurf contours — significant variables only (SST mean, salinity)
-## Variable names omitted from plot top; identified by panel letter + caption.
-panel_vars <- list(
-  c = list(vals = env_mva$sst_mean, label = "SST mean"),
-  d = list(vals = env_mva$salinity, label = "Salinity")
-)
+## (c–d) ordisurf contours — the two variables with the lowest p in Table 2 (tab2_raw;
+## with pa_min_pct = 0.001: distance to shore and PP mean). Variable names omitted from
+## plot top; identified by panel letter + caption.
+top2 <- head(tab2_raw$variable[order(tab2_raw$p.value)], 2)
+cat("Fig 5 c-d:", paste(top2, collapse = ", "), "\n")
+panel_vars <- setNames(lapply(top2, function(v) list(vals = env_vars_gam[[v]], label = v)),
+                       c("c", "d"))
 
 for (ltr in names(panel_vars)) {
   pv <- panel_vars[[ltr]]
@@ -2545,16 +2827,16 @@ cat("NMDS stress:", round(nmds_res$stress, 3), "\n")
 ## Build L, R, Q matrices
 
 ```{r fc_matrices}
-## ---- 1. Build the L matrix (sites × species, percent_reads) ----------------
+## ---- 1. Build the L matrix (sites × species, presence/absence) --------------
+## Same matrix as manyglm (comm_pa). L_long (percent reads) is kept only for the
+## read-coverage line in trait_diagnostics.
 L_long <- dat_all_filt_combine_prim %>%
   ungroup() %>%
   select(sample_id, lineage, percent_reads) %>%
   group_by(sample_id, lineage) %>%
   summarise(percent_reads = sum(percent_reads), .groups = "drop")
 
-L_wide <- L_long %>%
-  pivot_wider(names_from = lineage, values_from = percent_reads, values_fill = 0) %>%
-  column_to_rownames("sample_id")
+L_wide <- comm_pa
 
 ## ---- 2. Build the R matrix (sites × env variables) -------------------------
 ## Matches manyglm predictors: 4 continuous env vars + habitat (categorical).
@@ -2587,12 +2869,15 @@ L_wide <- L_wide[rownames(R_mat), ]
 ## kingdom — strip prefix for matching, restore afterwards (same as tiding join).
 lwide_stripped <- sub("^[^;]+;", "", colnames(L_wide))
 
-## trait_dat is pre-cleaned (zone renamed from zone...16, recoding applied)
+## trait_dat = final trait data (one row per lineage)
+## planktonic_larva left out (decided 2026-10-23): it applies only to metazoans and
+## is confounded with size/kingdom (212 of 219 "yes" are animals); kept in the trait
+## table for a possible metazoan-only fourth-corner analysis
+fc_traits <- c("zone", "trophic_level", "size_class", "mobility")
 Q_mat <- trait_dat %>%
   distinct(lineage, .keep_all = TRUE) %>%
   filter(lineage %in% lwide_stripped) %>%
-  select(lineage, zone, trophic.level, as_catagory,
-         planktonic.larval.form, mobility) %>%
+  select(lineage, all_of(fc_traits)) %>%
   column_to_rownames("lineage") %>%
   mutate(across(where(is.character), as.factor)) %>%
   as.data.frame()
@@ -2637,7 +2922,9 @@ kable(step_df, col.names = c("Step", "N species"), format = "html",
 ## ── 2. Community read coverage ────────────────────────────────────────────────
 reads_total    <- sum(L_long$percent_reads[
                     L_long$sample_id %in% rownames(L_wide)])
-reads_retained <- sum(L_wide)
+reads_retained <- sum(L_long$percent_reads[
+                    L_long$sample_id %in% rownames(L_wide) &
+                    L_long$lineage %in% colnames(L_wide)])
 cat(sprintf(
   "\nRead coverage: retained species account for %.1f%% of reads in analysed samples.\n\n",
   100 * reads_retained / reads_total
@@ -2647,8 +2934,7 @@ cat(sprintf(
 Q_all_matched <- trait_dat %>%
   distinct(lineage, .keep_all = TRUE) %>%
   filter(lineage %in% shared_stripped) %>%
-  select(zone, trophic.level, as_catagory,
-         planktonic.larval.form, mobility)
+  select(all_of(fc_traits))
 
 miss_df <- data.frame(
   Trait       = colnames(Q_all_matched),
@@ -2707,11 +2993,12 @@ if (length(factor_traits) >= 2) {
 
 ## Fourth corner fit
 Fourth-corner test (Dray & Legendre 2008, Ecology 89:3400–3412). `modeltype=6`
-combined permutation test; `p.adjust.method="none"` correct — the combined
-permutation IS the multiple-testing correction. Display threshold α = 0.2.
+combined permutation test; per-cell p-values, α = 0.05 (`fc_alpha`).
 Run this chunk before `rlq_biplot` and `fourth_corner_plot`.
 
 ```{r fc_fit}
+keep_awake()
+
 fc_res <- fourthcorner(
   tabR               = R_mat,
   tabL               = L_wide,
@@ -2725,31 +3012,36 @@ print(fc_res)
 
 nR <- length(fc_res$colnames.R)   # includes expanded habitat levels
 nQ <- length(fc_res$colnames.Q)
+fc_mat <- function(x) matrix(x, nrow = nR, ncol = nQ,
+                             dimnames = list(fc_res$colnames.R, fc_res$colnames.Q))
 
-## D2 and D statistics (for continuous R rows)
-d2_mat   <- matrix(fc_res$tabD2$obs,    nrow = nR, ncol = nQ,
-                   dimnames = list(fc_res$colnames.R, fc_res$colnames.Q))
-d_mat    <- matrix(fc_res$tabD$obs,     nrow = nR, ncol = nQ,
-                   dimnames = list(fc_res$colnames.R, fc_res$colnames.Q))
+## Per-cell (env variable or habitat level x trait level) results come from tabD2:
+##  - continuous env x trait level: statistic "r" (signed correlation)
+##  - habitat level x trait level:  statistic "N" (summed abundance in the cell; always
+##    positive, so NOT a direction)
+## Std.Obs = (observed - permutation mean) / permutation SD is signed and on the same
+## scale for both: > 0 = positive association / over-represented, < 0 = the opposite.
+## It is used for colour (direction) and |Std.Obs| for dot size.
+## (Fixed 2026-10-26: habitat rows previously took p-values and dot sizes from tabG,
+## which has one value per VARIABLE pair (5 x 4 = 20), recycled into the 7 x 14 cell
+## grid, and coloured by N; continuous r values (+-0.11) all looked yellow on a +-26 scale.)
+d2_mat   <- fc_mat(fc_res$tabD2$obs)                    # r or N (reference only)
+ses_mat  <- fc_mat(fc_res$tabD2$expvar[, "Std.Obs"])    # signed standardised effect
+pval_mat <- fc_mat(fc_res$tabD2$pvalue)                 # per-cell p (two-sided)
+fc_alpha <- 0.05   # significance for tiles + RLQ trait arrows
+cat(sprintf("cells with p <= %.2f: %d of %d\n", fc_alpha,
+            sum(pval_mat <= fc_alpha), length(pval_mat)))
 
-## G statistic (for categorical R rows — habitat levels)
-g_mat    <- matrix(fc_res$tabG$obs,    nrow = nR, ncol = nQ,
-                   dimnames = list(fc_res$colnames.R, fc_res$colnames.Q))
-
-## Combined p-value matrix: D2 p-values for continuous rows, G p-values for habitat rows.
-## fc_res$assignR maps each expanded colnames.R entry to its original variable (1-indexed).
-## fc_res$indexR gives the type (1 = continuous, 2 = categorical) per original variable.
-row_type  <- fc_res$indexR[fc_res$assignR]   # type per expanded R row
-pval_d2   <- matrix(fc_res$tabD2$pvalue, nrow = nR, ncol = nQ,
-                    dimnames = list(fc_res$colnames.R, fc_res$colnames.Q))
-pval_g    <- matrix(fc_res$tabG$pvalue,  nrow = nR, ncol = nQ,
-                    dimnames = list(fc_res$colnames.R, fc_res$colnames.Q))
-pval_mat  <- pval_d2
-pval_mat[row_type == 2, ] <- pval_g[row_type == 2, ]   # habitat rows use G p-values
-
+row_type <- fc_res$indexR[fc_res$assignR]   # 1 = continuous, 2 = categorical (habitat)
 cat("R variable types (1=continuous, 2=categorical):\n")
 print(data.frame(var = fc_res$colnames.R, type = row_type))
-cat("Row sums d2_mat:", paste(round(rowSums(d2_mat), 3), collapse = ", "), "\n")
+
+## variable-level tests (one per env variable x trait; F / Chi2), for the text
+fc_var_tab <- data.frame(pair = fc_res$tabG$names, stat = fc_res$tabG$statnames,
+                         obs = round(fc_res$tabG$obs, 3), p = fc_res$tabG$pvalue)
+print(fc_var_tab)
+
+allow_sleep()
 ```
 
 
@@ -2757,7 +3049,7 @@ cat("Row sums d2_mat:", paste(round(rowSums(d2_mat), 3), collapse = ", "), "\n")
 RLQ site scores coloured by habitat with 75% data ellipses (`type = "norm"`
 = data ellipse unaffected by sample size, unlike CI ellipses which inflate
 with small n). Trait arrows filtered to fourth-corner significant levels
-(p ≤ 0.2 from fc_fit); all env variable arrows retained (only 4 total).
+(p ≤ `fc_alpha` = 0.05 from fc_fit); all env variable arrows retained (only 4 total).
 
 ```{r rlq_biplot}
 ## ---- RLQ ordination ---------------------------------------------------------
@@ -2776,8 +3068,10 @@ dev.off()
 rlq_sites <- as.data.frame(rlq_res$lR) %>%
   rownames_to_column("sample_id") %>%
   rename(RLQ1 = 2, RLQ2 = 3) %>%
-  left_join(distinct(plot_dat_phylum, sample_id, habitat), by = "sample_id") %>%
-  mutate(habitat = factor(habitat, levels = names(hab_cols)))
+  ## habitat from R_mat (same samples as the RLQ, no NAs)
+  mutate(habitat = factor(as.character(R_mat$habitat[match(sample_id, rownames(R_mat))]),
+                          levels = names(hab_cols)))
+stopifnot(!anyNA(rlq_sites$habitat))
 
 rlq_env <- as.data.frame(rlq_res$l1) %>%
   rownames_to_column("var") %>%
@@ -2788,8 +3082,8 @@ rlq_traits_all <- as.data.frame(rlq_res$c1) %>%
   rename(RLQ1 = 2, RLQ2 = 3)
 
 ## ---- Filter trait arrows to fourth-corner significant levels ----------------
-## sig_fc_levels: trait levels where min p across env vars ≤ 0.2
-sig_fc_levels <- fc_res$colnames.Q[apply(pval_mat, 2, min) <= 0.2]
+## sig_fc_levels: trait levels where min p across env vars ≤ fc_alpha
+sig_fc_levels <- fc_res$colnames.Q[apply(pval_mat, 2, min) <= fc_alpha]
 
 rlq_traits_sig <- rlq_traits_all %>%
   filter(trait %in% sig_fc_levels) %>%
@@ -2809,7 +3103,8 @@ env_lbl_arr <- c(sst_mean      = "SST mean",
 rlq_env_plot <- rlq_env %>%
   mutate(xend  = RLQ1 * arr_mul,  yend  = RLQ2 * arr_mul,
          lbl_x = RLQ1 * arr_mul * 1.18, lbl_y = RLQ2 * arr_mul * 1.18,
-         label = unname(env_lbl_arr[var]))
+         ## habitat levels come out as "habitat.Coral" etc. -> label with the level name
+         label = coalesce(unname(env_lbl_arr[var]), sub("^habitat\\.", "", var)))
 
 ## Scale trait arrows by the same factor
 rlq_traits_plot <- rlq_traits_sig %>%
@@ -2861,8 +3156,9 @@ ggsave(paste0(dir, plot_file, "/Fig_RLQ_biplot.tiff"),
 
 ## Fourth corner plot
 Tile + dot plot: env variables on x-axis, trait categories on y-axis grouped
-into trait facets. Tile shading = significance (α = 0.2); dot colour =
-direction (D stat, Zissou1 blue→red); dot size = strength (√D²).
+into trait facets. Tile shading = per-cell p ≤ 0.05; dot
+colour = direction (standardised effect, blue = negative, red = positive); dot size =
+strength (|standardised effect|).
 
 ```{r fourth_corner_plot}
 ## Axis labels: continuous env vars + habitat levels (expanded from factor)
@@ -2884,9 +3180,9 @@ env_row_lbl <- setNames(
 clean_level     <- sub("^[^.]+\\.", "", fc_res$colnames.Q)
 trait_group     <- fc_res$varnames.Q[fc_res$assignQ]
 trait_group_lbl <- c(zone                   = "Zone",
-                     trophic.level          = "Trophic level",
-                     as_catagory            = "Body size",
-                     planktonic.larval.form = "Planktonic larval",
+                     trophic_level          = "Trophic level",
+                     size_class             = "Body size",
+                     planktonic_larva       = "Planktonic larval",
                      mobility               = "Mobility")
 
 to_long_fc <- function(mat, val) {
@@ -2898,16 +3194,13 @@ to_long_fc <- function(mat, val) {
 ## row_type_long: 1 = continuous, 2 = categorical (habitat); drives dot display.
 row_type_vec <- setNames(row_type, fc_res$colnames.R)
 
-fc_long <- to_long_fc(d2_mat, "D2") %>%
+fc_long <- to_long_fc(ses_mat, "SES") %>%
   left_join(to_long_fc(pval_mat, "p_value"), by = c("env", "trait_level")) %>%
-  left_join(to_long_fc(d_mat,   "D_stat"),  by = c("env", "trait_level")) %>%
-  left_join(to_long_fc(g_mat,   "G_stat"),  by = c("env", "trait_level")) %>%
   mutate(
     r_type      = unname(row_type_vec[env]),
-    sig_tile    = if_else(p_value <= 0.2, "significant", "not significant"),
-    ## Dot size: √D2 for continuous rows, √G for habitat rows
-    dot_size    = if_else(r_type == 1, sqrt(pmax(D2, 0)), sqrt(pmax(G_stat, 0))),
-    D_stat_plot = D2,      ## tabD2 is signed (-0.15 to +18.6); tabD is unsigned magnitude
+    sig_tile    = if_else(p_value <= fc_alpha, "significant", "not significant"),
+    ## colour = signed standardised effect, size = its magnitude (same for all rows)
+    dot_size    = abs(SES),
     env_label   = unname(env_row_lbl[env]),
     level_clean = clean_level[match(trait_level, fc_res$colnames.Q)],
     trait_grp   = trait_group[match(trait_level, fc_res$colnames.Q)],
@@ -2922,27 +3215,29 @@ fc_long <- to_long_fc(d2_mat, "D2") %>%
     level_f     = factor(level_clean, levels = unique(clean_level))
   )
 
-col_sig <- c("not significant" = "grey85", "significant" = "grey40")
 
-## Symmetric limits force the legend to span full blue→red even though all
-## observed D values are positive (data appears yellow→red in the plot).
-## This matches Fig 4's palette and makes clear negative relationships are possible.
-max_d <- max(abs(fc_long$D_stat_plot), na.rm = TRUE)
+## Colour as Fig 4: yellow only in a narrow band around 0, so sign is obvious.
+## Fixed limits +-3 standardised effect (values beyond are squished to the end colour).
+ses_lim <- 3
 
 fc_gg <- ggplot(fc_long, aes(env_f, level_f)) +
   facet_grid(trait_grp_f ~ ., scales = "free_y", space = "free_y", switch = "y") +
   geom_tile(aes(fill = sig_tile), colour = "grey50",
             width = 0.92, height = 0.92) +
-  scale_fill_manual(values = col_sig, name = NULL) +
-  ## All rows (continuous + habitat): colour = D stat, size = strength
-  geom_point(aes(colour = D_stat_plot, size = dot_size)) +
-  scale_colour_gradient2(
-    name     = "Direction\n(D stat)",
-    low      = pal3[1], mid = pal3[2], high = pal3[3],
-    midpoint = 0,
-    limits   = c(-max_d, max_d)
+  scale_fill_manual(values = col_sig, limits = names(col_sig), breaks = "significant",
+                    labels = paste0("p \u2264 ", fc_alpha), name = NULL) +
+  ## All rows (continuous + habitat): colour = signed standardised effect, size = |effect|
+  geom_point(aes(colour = SES, size = dot_size)) +
+  scale_colour_gradientn(
+    name   = "Standardised\neffect",
+    colors = pal_div,
+    space  = "Lab",
+    values = scales::rescale(c(-ses_lim * 1.1, -ses_lim / 9, 0, ses_lim / 9, ses_lim * 1.1)),
+    limits = c(-ses_lim * 1.1, ses_lim * 1.1),
+    breaks = c(-ses_lim, -ses_lim / 2, 0, ses_lim / 2, ses_lim),
+    oob    = scales::squish
   ) +
-  scale_size_continuous(name = "Strength", range = c(1, 7)) +
+  scale_size_continuous(name = "Effect size", range = c(1, 7)) +
   theme_minimal() +
   theme(
     strip.text.y.left = element_text(size = 9, face = "bold", angle = 0),
@@ -2965,7 +3260,7 @@ ggsave(paste0(dir, plot_file, "/Fig6_fourth_corner.tiff"),
 
 
 ## Distance decay
-Bray-Curtis dissimilarity vs. through-water geographic distance (km).
+Jaccard dissimilarity (presence/absence) vs. through-water geographic distance (km).
 
 Run `through_water_dist` once to download bathymetry and compute the distance
 matrix, then set that chunk to `eval=FALSE` for subsequent knits.
@@ -3005,8 +3300,29 @@ water_rast <- terra::focal(water_rast, w = 3, fun = "max", na.rm = TRUE,
                            na.policy = "omit")
 water_rast[!is.na(water_rast)] <- 1
 
-## SpatVector of sample points for extraction
-pts_vect <- terra::vect(pts_all, geom = c("lon", "lat"), crs = "EPSG:4326")
+## Keep only the main connected water body (drops lagoons/ponds cut off by land at
+## this resolution), so every pair of sites has a water route
+wp <- terra::patches(water_rast, directions = 8)
+main_patch <- as.integer(names(which.max(table(terra::values(wp, na.rm = TRUE)))))
+water_rast[wp != main_patch] <- NA
+
+## Snap sites whose cell is not in the main water body to the nearest water cell
+## (coastal points can fall on land cells even after the dilation). Without this,
+## those sites got NA distances and their pairs were silently dropped from Fig 7.
+water_xy <- terra::xyFromCell(water_rast, which(!is.na(terra::values(water_rast))))
+pts_all$cell <- terra::cellFromXY(water_rast, cbind(pts_all$lon, pts_all$lat))
+pts_all$snap_km <- 0
+for (i in which(is.na(terra::values(water_rast)[pts_all$cell]))) {
+  near <- which(abs(water_xy[, 1] - pts_all$lon[i]) < 0.5 &
+                abs(water_xy[, 2] - pts_all$lat[i]) < 0.5)
+  dkm  <- terra::distance(cbind(pts_all$lon[i], pts_all$lat[i]), water_xy[near, , drop = FALSE],
+                          lonlat = TRUE) / 1000
+  k    <- near[which.min(dkm)]
+  pts_all$cell[i]    <- terra::cellFromXY(water_rast, water_xy[k, , drop = FALSE])
+  pts_all$snap_km[i] <- min(dkm)
+}
+cat("Sites snapped to water:", sum(pts_all$snap_km > 0), "; max shift",
+    round(max(pts_all$snap_km), 1), "km\n")
 n <- nrow(pts_all)
 
 ## Build symmetric distance matrix; gridDist routes through water only
@@ -3015,17 +3331,20 @@ tw_mat <- matrix(NA_real_, n, n,
 diag(tw_mat) <- 0
 
 for (i in seq_len(n)) {
-  tmp  <- water_rast
-  cell <- terra::cellFromXY(tmp, cbind(pts_all$lon[i], pts_all$lat[i]))
-  tmp[cell] <- 2                        # mark focal site as target
+  tmp <- water_rast
+  tmp[pts_all$cell[i]] <- 2                       # mark focal site as target
   d <- terra::gridDist(tmp, target = 2) / 1000   # metres → km
-  tw_mat[i, ] <- terra::extract(d, pts_vect)[, 2]
+  tw_mat[i, ] <- terra::values(d)[pts_all$cell]
 }
+tw_mat <- pmax(tw_mat, t(tw_mat))   # symmetric (differences are rounding only)
+diag(tw_mat) <- 0
+stopifnot(all(is.finite(tw_mat)))
 
 write.csv(tw_mat, paste0(dir, "through_water_dist_km.csv"), row.names = TRUE)
 cat("Saved:", n, "×", n, "through-water distance matrix\n")
 ```
 
+## Fig 7 – distance decay plot
 ```{r dist_decay}
 ## ---- helper: dist object → data frame --------------------------------------
 dist2df <- function(inDist) {
@@ -3040,18 +3359,10 @@ dist2df <- function(inDist) {
   )
 }
 
-## ---- OTU-style wide table (samples × taxa) ----------------------------------
-min_samp_occur <- 2   # drop taxa present in fewer than this many samples
-otu_wide <- dat_all_filt_combine_prim %>%
-  filter(type == "sample") %>%
-  select(sample_id, lineage, percent_reads) %>%
-  group_by(sample_id, lineage) %>%
-  summarise(percent_reads = sum(percent_reads), .groups = "drop") %>%
-  pivot_wider(names_from = lineage, values_from = percent_reads, values_fill = 0) %>%
-  column_to_rownames("sample_id")
+## ---- presence/absence table (samples × taxa), same matrix as manyglm --------
+otu_wide <- comm_pa
 
-cc       <- apply(otu_wide, 2, function(x) sum(x > 0))
-otu_wide <- otu_wide[, cc >= min_samp_occur]
+## no extra occurrence cut (only occurrence filter is in the filter script)
 
 ## ---- sample metadata (including habitat) ------------------------------------
 sdat_dd <- dat_all_filt_combine_prim %>%
@@ -3068,8 +3379,8 @@ tw_mat   <- tw_mat[sdat_dd$sample_id, sdat_dd$sample_id]
 geo_dist <- as.dist(tw_mat)
 attr(geo_dist, "Labels") <- sdat_dd$sample_id
 
-## ---- Bray-Curtis dissimilarity ----------------------------------------------
-vg <- vegdist(otu_wide, method = "bray", binary = FALSE)
+## ---- Jaccard dissimilarity (presence/absence) --------------------------------
+vg <- vegdist(otu_wide, method = "jaccard", binary = TRUE)
 
 ## ---- Build pairwise data frame with habitat labels --------------------------
 pairs_df <- dist2df(geo_dist) %>%
@@ -3121,7 +3432,7 @@ p_dd <- ggplot() +
   scale_colour_manual(values = hab_cols, name = "Habitat") +
   scale_fill_manual(values  = hab_cols, name = "Habitat") +
   labs(x = "Through-water distance (km)",
-       y = "Bray-Curtis dissimilarity") +
+       y = "Jaccard dissimilarity") +
   theme_minimal(base_size = 11) +
   theme(legend.position = "right")
 
@@ -3133,6 +3444,8 @@ ggsave(paste0(dir, plot_file, "/Fig7_dist_decay.tiff"),
 
 ## Mantel correlogram — diagnostic only, not a manuscript figure
 ```{r mantel_diag, eval=FALSE}
+## needs vg (Jaccard) and geo_dist (through-water km) from dist_decay
+if (!exists("vg") || !exists("geo_dist")) stop("run the dist_decay chunk first")
 mantel_corr <- mantel.correlog(vg, D.geo = geo_dist,
   n.class = 0, cutoff = TRUE, r.type = "pearson",
   nperm = 999, mult = "holm", progressive = TRUE)

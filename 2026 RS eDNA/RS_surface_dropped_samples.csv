@@ -1,0 +1,88 @@
+sample_id,habitat,area,year,reads_18S_V9,reads_18S_V7,status
+CCF_S 2017 AL CR1,Coral,Al Lith,2017,37780,27799,retained
+CCF_S 2017 AL CR2,Coral,Al Lith,2017,30210,22304,retained
+CCF_S 2017 AL CR3,Coral,Al Lith,2017,30079,25584,retained
+CCF_S 2017 AW CR1,Coral,Al Wajh,2017,41907,21356,retained
+CCF_S 2017 AW CR2,Coral,Al Wajh,2017,63609,39168,retained
+CCF_S 2017 AW CR3,Coral,Al Wajh,2017,35289,27867,retained
+CCF_S 2017 DU CR1,Coral,Duba,2017,37036,46209,retained
+CCF_S 2017 DU CR2,Coral,Duba,2017,46345,31939,retained
+CCF_S 2017 DU CR3,Coral,Duba,2017,46179,34446,retained
+CCF_S 2017 FB CR1,Coral,Farasan Bank,2017,36159,27974,retained
+CCF_S 2017 FB CR2,Coral,Farasan Bank,2017,30471,24174,retained
+CCF_S 2017 TU CR1,Coral,Thuwal,2017,77904,39504,retained
+CCF_S 2017 TU CR2,Coral,Thuwal,2017,42504,23111,retained
+CCF_S 2017 TU CR3,Coral,Thuwal,2017,42392,14920,retained
+CCF_S 2017 YB CR1,Coral,Yanbu,2017,50019,30111,retained
+CCF_S 2017 YB CR2,Coral,Yanbu,2017,49335,23309,retained
+CCF_S 2017 YB CR3,Coral,Yanbu,2017,47553,59908,retained
+CCF_W 2017 AB CR,Coral,Abunal,2017,51116,21314,retained
+CCF_W 2017 AL CR1,Coral,Al Lith,2017,56084,36124,retained
+CCF_W 2017 AL CR2,Coral,Al Lith,2017,119100,30745,retained
+CCF_W 2017 AW CR1,Coral,Al Wajh,2017,48388,24337,retained
+CCF_W 2017 AW CR2,Coral,Al Wajh,2017,21907,26371,retained
+CCF_W 2017 AW CR3,Coral,Al Wajh,2017,36424,27048,retained
+CCF_W 2017 DU CR1,Coral,Duba,2017,49738,22375,retained
+CCF_W 2017 DU CR3,Coral,Duba,2017,58340,11270,retained
+CCF_W 2017 YB CR1,Coral,Yanbu,2017,48864,46006,retained
+CCF_W 2017 YB CR2,Coral,Yanbu,2017,50070,34800,retained
+CCF_W 2017 YB CR3,Coral,Yanbu,2017,67714,28280,retained
+DC 2016 C1,Coral,Al Qasabah,2016,38495,29367,retained
+DC 2016 C2,Coral,Al Qasabah,2016,53101,53837,retained
+DC 2016 C4,Coral,Al Wajh,2016,38487,23424,retained
+DC 2016 M1,Mangrove,North RS down Duba,2016,20552,11648,retained
+DC 2016 M2,Mangrove,"Al Wajh S, edge of mangrove",2016,45768,9552,retained
+DC 2016 M7,Mangrove,Farasan Banks (Ghubbat),2016,53317,28554,retained
+DC 2016 M8,Mangrove,Al Karrar,2016,87950,41174,retained
+DC 2017 M D1,Mangrove,Al-Wajh,2017,58109,29972,retained
+DC 2017 M D2,Mangrove,Al-Wajh,2017,70610,27416,retained
+DC 2017 M1,Mangrove,North RS,2017,41568,24031,retained
+DC 2017 M2,Mangrove,North Al-Wajh,2017,47453,55436,retained
+DC 2017 M3,Mangrove,South Al-Wajh,2017,35490,35679,retained
+DC 2017 M4,Mangrove,South-South Farasan Banks,2017,62981,18934,retained
+DC 2017 M5,Mangrove,South Farasan Banks,2017,2882,14861,retained
+DC 2017 MB,Mangrove,Al-Wajh,2017,78002,21298,retained
+CCF_S 2017 AL SG,Seagrass,Al Lith,2017,23097,20414,retained
+CCF_S 2017 AW SG,Seagrass,Al Wajh,2017,21659,15041,retained
+CCF_S 2017 CCF SG,Seagrass,,2017,26777,48186,retained
+CCF_S 2017 DU SG,Seagrass,Duba,2017,23768,17453,retained
+CCF_S 2017 TU SG,Seagrass,Thuwal,2017,37997,25536,retained
+CCF_W 2017 AL SG,Seagrass,Al Lith,2017,46055,18979,retained
+CCF_W 2017 AW SG,Seagrass,Al Wajh,2017,38368,30648,retained
+CCF_W 2017 DU SG,Seagrass,Duba,2017,38159,17487,retained
+CCF_W 2017 KT SG,Seagrass,KAUST,2017,66981,21688,retained
+DC 2016 S10,Seagrass,Farasan Bank,2016,25992,34756,retained
+DC 2016 S11,Seagrass,Al Kharar,2016,42090,10775,retained
+DC 2016 S2,Seagrass,Al Qasabah,2016,35513,46336,retained
+DC 2016 S3,Seagrass,Al Wajh,2016,47593,30554,retained
+DC 2016 S4,Seagrass,Al Wajh,2016,78060,16468,retained
+DC 2016 S5,Seagrass,Al Wajh,2016,52584,13134,retained
+DC 2016 S6,Seagrass,Farasan Bank,2016,58580,19613,retained
+DC 2016 S7,Seagrass,Farasan Bank,2016,37235,24626,retained
+DC 2016 S8,Seagrass,Farasan Bank,2016,17141,8584,retained
+DC 2017 S D2,Seagrass,Al-Wajh,2017,84520,30737,retained
+DC 2017 S10,Seagrass,South Farasan Banks,2017,22777,14764,retained
+DC 2017 S4,Seagrass,North Al-Wajh,2017,50515,23921,retained
+DC 2017 S6,Seagrass,South-South Farasan Banks,2017,7326,41794,retained
+DC 2017 S7,Seagrass,South-South Farasan Banks,2017,49961,19780,retained
+DC 2017 S8,Seagrass,South Farasan Banks,2017,108981,28140,retained
+DC 2017 S9,Seagrass,South Farasan Banks,2017,34997,25393,retained
+DC 2017 SA,Seagrass,Al-Wajh,2017,66431,31467,retained
+DC 2017 SB,Seagrass,Al-Wajh,2017,53862,13721,retained
+DC 2017 SC,Seagrass,Al-Wajh,2017,103996,22811,retained
+DC 2017 Sg1,Seagrass,North RS,2017,6551,33112,retained
+DC 2017 Sg2,Seagrass,North RS,2017,58883,48848,retained
+CCF_W 2017 AL CR3,Coral,Al Lith,2017,44821,9,"< 1000 reads, one primer"
+CCF_W 2017 DU CR2,Coral,Duba,2017,36071,37,"< 1000 reads, one primer"
+DC 2016 C5,Coral,Al Wajh,2016,41097,1,"< 1000 reads, one primer"
+DC 2016 M10,Mangrove,KAEC,2016,55341,8,"< 1000 reads, one primer"
+DC 2016 M3,Mangrove,"Al Wajh S, centre of mangrove",2016,,,not in sequence data
+DC 2016 M4,Mangrove,Al Lith/ Farasan Bank,2016,,,not in sequence data
+DC 2016 M5,Mangrove,Farasan Bank/Al Lith,2016,75800,135,"< 1000 reads, one primer"
+DC 2016 M6,Mangrove,Farasan Bank,2016,,,not in sequence data
+CCF_S 2017 YB SG,Seagrass,Yanbu,2017,,,not in sequence data
+CCF_W 2017 YB SG,Seagrass,Yanbu,2017,40153,9,"< 1000 reads, one primer"
+DC 2016 S9,Seagrass,Farasan Bank,2016,22216,19,"< 1000 reads, one primer"
+DC 2017 E1,Seagrass,Al-Wajh,2017,135156,9,"< 1000 reads, one primer"
+DC 2017 S5,Seagrass,South Al-Wajh,2017,418836,12,"< 1000 reads, one primer"
+DC 2017 Sg3,Seagrass,North RS,2017,9686,616,"< 1000 reads, one primer"

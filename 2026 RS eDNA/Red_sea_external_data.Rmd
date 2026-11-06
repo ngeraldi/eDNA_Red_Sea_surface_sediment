@@ -79,7 +79,7 @@ out_file         <- ""    # summary outputs → dir
 plot_file        <- "plots"  # plots subfolder: dir/plots/
 
 # filtered sequence data (output of post-DADA2 Rmd)
-dat_name <- paste0(stud_pat, "_filtered_data_all.csv")
+dat_name <- paste0(stud_pat, "_filtered_data_all.csv.gz")   # fread reads .gz directly (needs R.utils)
 
 # sample metadata Excel
 sam_file_path <- paste0(dir, "RS_surface_sample_data_all.xlsx")
